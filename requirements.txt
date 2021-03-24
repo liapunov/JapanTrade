@@ -1,0 +1,8 @@
+###### Requirements without Version Specifiers ######
+beautifulsoup4
+numpy
+requests
+seaborne
+
+###### Requirements with Version Specifiers ######
+pandas >= 1.0.0
