@@ -252,8 +252,8 @@ No data were acquired.")
         - "HS", a code used to identify the category of the imported/exported
           product.
         - "unit": Kgs, Tons, Number of, 000 JPYs etc.
-        - "date": a string (not a date time) of the form AAAA-MM
-        - "measure": integer with the value (in "unit") for the tuple (country,
+        - "date": a string (not a date time) of the form AAAA-MM-01
+        - "value": integer with the value (in "unit") for the tuple (country,
            HS, date)
 
         In case the file is a zip with multiple csv files, the function opens
@@ -272,8 +272,8 @@ No data were acquired.")
             a Pandas DataFrame with the trade data already normalized
         """
         trade_types = {'HS': 'category', 'Country': 'category',
-                       'Commodity': 'category',
-                       'date': object, 'unit': 'category', 'measure': 'Int64'}
+                       'code': 'category',
+                       'date': object, 'unit': 'category', 'value': 'Int64'}
         df = self._opener()[filename[-3:]](filename, trade_types, raw=False)
         if kind == 'infer':
             kind = self._infer_kind(df, raw=False)
@@ -281,7 +281,7 @@ No data were acquired.")
 
     def _meltMonths(self, df, kind):
         """
-        Melt all the "unit-month" columns into a narrow form.
+        Melt all the "unit-month" columns into a long format.
 
         - "date", a Y-M-D date format with the last day of the month
         - "type", with one of the three possible values "Quantity1",
@@ -290,9 +290,9 @@ No data were acquired.")
         """
         # this dictionary will be useful to convert the months from words
         # to digits
-        month_dict = {'Jan': "-01", 'Feb': "-02", 'Mar': "-03", 'Apr': "-04",
-                      'May': "-05", 'Jun': "-06", 'Jul': "-07", 'Aug': "-08",
-                      'Sep': "-09", 'Oct': "-10", 'Nov': "-11", 'Dec': "-12"}
+        month_dict = {'Jan': "01", 'Feb': "02", 'Mar': "03", 'Apr': "04",
+                      'May': "05", 'Jun': "06", 'Jul': "07", 'Aug': "08",
+                      'Sep': "09", 'Oct': "10", 'Nov': "11", 'Dec': "12"}
 
         # a very lousy check but a check nontheless...
         if len(df.columns) < 20:
@@ -345,7 +345,7 @@ monthly columns!")
         # now, merging creating a datetime column from the year and the month
         start_date = time()
         melted['month'] = melted['month'].replace(month_dict)
-        melted['date'] = melted.Year + melted.month
+        melted['date'] = melted['Year'] + "-" + melted['month'] + "-01"
         end_date = time()
         date_time = end_date - start_date
 

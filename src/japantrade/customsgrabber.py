@@ -32,8 +32,8 @@ class CustomsGrabber():
     file_address = "https://www.e-stat.go.jp/en/stat-search/files/data?page=1&files="
     dir_params = {'HS': {'import': 'tclass2=000001013182',
                          'export': 'tclass2=000001013181'},
-                  'PC': {'import': 'tclass2=000001013196',
-                         'export': 'tclass2=000001013197'}}
+                  'PC': {'import': 'tclass2=000001013197',
+                         'export': 'tclass2=000001013196'}}
     common_params = "layout=dataset&toukei=00350300&tstat=000001013141"
     save_folder = "../data/"
 

@@ -15,7 +15,6 @@ This module contains a single class, TradeFile.
 # coding: utf-8
 
 from __future__ import print_function
-import numpy as np
 import pandas as pd
 import logging
 from tradefile import TradeFile as trf
@@ -33,6 +32,9 @@ console.setFormatter(formatter)
 logging.getLogger().addHandler(console)
 log = logging.getLogger("tradeanalysis")
 
+default_pc_dict = "../data/PC_codes.csv"
+default_hs_dict = "../data/HS_codes.csv"
+default_country_dict = "../data/country_codes.csv"
 
 class TradeReport():
     """Reporting tools for normalized trade data."""
@@ -41,7 +43,8 @@ class TradeReport():
     # trade dataframe class.
     trade_df_col_name = {"kind", "country", "code", "date", "unit", "value"}
     trade_df_keys = ["kind", "date", "country", "code", "unit"]
-    trade_df_units = {'NO', 'MT', 'KG', 'KL', 'SM', 'GR', 'TH', 'DZ', 'JPY'}
+    trade_df_units = {' L', 'PR', 'JPY', 'SM', 'DZ', 'KL', 'TH', 'KG', 'ST', 
+                      'GT', 'MT', 'CT', 'NO', 'GR', ' M', 'CM'}
 
     def __init__(self, source_file=None, source_df=None, kind='infer'):
         """
@@ -131,8 +134,14 @@ class TradeReport():
             sorted_df = df.dropna().set_index(keys).sort_index()
             return sorted_df
 
+    def _dates_exist(self, start_date, end_date):
+        return start_date >= self.first_date and end_date <= self.last_date
+
+    def _country_exists(self, country):
+        return int(country) in self.trade_df.index.get_level_values('country')
+
     def yoy_country_report(self, kind="HS", country="220", value_cut=10**6,
-                           val_only=True, method="last_12"):
+                           code_level=3, val_only=True, method="last_12"):
         """
         Create a year-on-year report for a single country given a country code.
 
@@ -152,6 +161,10 @@ the code of a country.
         value_cut : Int64, optional
             Minimum threshold of reporting for the monetary value of a trade. \
 The default is 10 million.
+        
+        code_level : Int64, optional
+            The minimum length of the codes to be reported. \
+The default is 3.
 
         val_only : boolean, optional
             Whether to report only the monetary value of trade. \
@@ -159,6 +172,8 @@ The default is True.
 
         method : {"last_year", "last_12"}, optional
             The report can account for the reporting period in two ways:
+        - "curr_year": the cur_period will be yyyy_1-12 if the current year \
+has all the months, yyyy_1-xx instead
         - "last_year": the cur_period will be yyyy_1-12 if the last year has \
 all the months, yyyy_1-xx instead
         - "last_12": takes the last 12 months. cur_period will be \
@@ -186,53 +201,55 @@ two quantities.
         """
         # do we have all that we need?
         # check the periods first.
-        pass
+        if method == 'curr_year':
+            end_date = self.last_date
+            start_date = pd.datetime(f"{self.last_date.year()}-1-1")
+        elif method == 'last_year':
+            end_date = pd.datetime(f"{self.last_date.year-1}-12-1")
+            start_date = pd.datetime(f"{self.last_date.year-1}-1-1")
+        elif method == 'last_12':
+            end_date = self.last_date
+            start_date = end_date - pd.DateOffset(months=12)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        if not self._dates_exist(start_date, end_date):
+            raise ValueError("Cannot use this method: not enough past data.")
+        # check the country
+        if not self._country_exists(country):
+            raise ValueError(f"Country code {country} does not exist")
 
-        # now let's check the HS codes. It might be that not all the chapters
-        # were present.
-        # since there may be HS codes that do not appear yoy, we will accept
-        # with a 90% overlapping.
-        pass
+        # time to drill down the dataframe.
+        # make sure to select only the codes with length>=code_level
+        code_mask = self.trade_df.index.get_level_values('code').str.len()\
+            >= code_level
 
-        # we only need the selected country. The Country column also can go.
-        country_slice = self.trade_df[self.trade_df["Country"] == country]\
-            .drop(columns=["Country"])
-
-        # now let's filter by minimum value
-        if value_cut is not None:
-            country_slice = country_slice[country_slice["measure"] > value_cut]
-
-        # now let's aggregate by period
-        period_map = self._perioder()
-        date_filtered_df = period_map[method](country_slice)
-        print(date_filtered_df)
-
-        # these are the units that will be used to calculate the trends
-        units = date_filtered_df.unit.unique()
-        print(units)
-
-        # pivot by hs code index & unit column
-        hs_grouped = pd.pivot_table(date_filtered_df, index=["HS"],
-                                    columns=["unit", "period"],
-                                    aggfunc={"measure": np.sum}).reset_index()
-        hs_grouped.columns = [' '.join(col).strip()
-                              for col in hs_grouped.columns.values]
-        print(hs_grouped.head())
-        print(hs_grouped.columns.tolist())
-
-        # adding the trend columns for each unit
-        for u in units:
-            if (not val_only) or ("JPY" in u):
-                try:
-                    hs_grouped[f"YoY Trend: {u}"] =\
-                        self._trendSeries(hs_grouped, f"measure {u} curr",
-                                          f"measure {u} prev")
-                except KeyError:
-                    pass
+        # restrict the unit to 'JPY' if val_only.
         if val_only:
-            cols = hs_grouped.columns.tolist()
-            not_val = [c for c in cols
-                       if "JPY" not in c and "measure" in c]
-            hs_grouped.drop(columns=not_val, inplace=True)
+            drilled_df = self.trade_df.loc[kind,
+                                           start_date:end_date,
+                                           country,
+                                           code_mask,
+                                           'JPY'].copy()
+        else:
+            drilled_df = self.trade_df.loc[kind,
+                                           start_date:end_date,
+                                           country,
+                                           code_mask,
+                                           :].copy()
+            log.debug(drilled_df.head(5))
+        # pivot by hs code index & unit column.
+        # Grouper is needed in order to properly group by month.
+        year_sums = drilled_df.droplevel(['kind', 'country']).\
+            groupby(['code', 'unit'] +
+                    [pd.Grouper(freq=pd.offsets.MonthBegin(12),
+                                level='date')])\
+            .sum()
+        log.debug(year_sums.head(5))
+        year_compared = year_sums.reset_index().pivot(index='code',
+                                                      columns=['unit', 'date'],
+                                                      values='value')
+        log.debug(year_compared)
+        hs_grouped = year_compared .\
+            sort_values(by=('JPY', end_date), ascending=False)
 
         return hs_grouped
