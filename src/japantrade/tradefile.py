@@ -59,7 +59,7 @@ the data.
     """
 
     def __init__(self, source=None, raw=True, direction='import',
-                 kind='infer', merge_file=None, merge_df=None):
+                 kind='infer', base_file=None, base_df=None):
         """
         Initialize a dataframe with a source trade file.
 
@@ -74,25 +74,29 @@ the data.
 
         kind : string
 
-        merge_file : string
-            (optional) path to an additional file to merge with the source
+        base_file : string
+            (optional) path to an existing csv the source will be merged to
 
-        merge_df : string
-            (optional) an additional DataFrame to merge with the source
+        base_df : string
+            (optional) an existing DataFrame the source will be merged to
         """
         if source is None:
             raise ValueError("You must specify the source file. Use raw=False\
                              if the file is already in normal form.")
 
-        if raw:
+        if base_file is not None:
+            self.data, self.kind = self._openNormalFile(base_file, kind)
+            self.data = self._acquireNewData(new_file=source, kind=kind)
+        elif base_df is not None:
+            self.data, self.kind = base_df, kind
+            self.data = self._acquireNewData(new_file=source, kind=kind)
+        elif raw:
             log.warning("Warning: this operation might take more than one \
  minute if the file spans over more years.")
             self.data, self.kind = self._dfFromRaw(source, kind)
         else:
             self.data, self.kind = self._openNormalFile(source, kind)
-
-        if merge_df is not None or merge_file is not None:
-            self.data = self._acquireNewData(merge_file, merge_df, kind)
+        
 
     def _infer_kind(self, df, raw=True):
         """
@@ -213,7 +217,7 @@ the data.
         """Clean the dataframe acquired from the raw data."""
         columns = df.columns.to_list()
         # check on the columns
-        if ('Unit2' not in columns) and ('Unit' not in columns):
+        if ('Unit2' not in columns) and 'Unit' not in columns:
             raise ValueError("This is not a standard raw file.\
 No data were acquired.")
         # some files have "Aplil" instead of "April"...
