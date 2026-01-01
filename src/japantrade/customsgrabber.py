@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
+import os
 import requests
 from bs4 import BeautifulSoup
 import datetime as dt
@@ -50,7 +51,8 @@ class CustomsGrabber():
         # year_param = "year=" + str(self.last) + "0"
         # self.query = "&".join([self.common_params, year_param, dir_params])
 
-    def _grabYear(self, year, direction='import', kind='HS', save_folder=None):
+    def _grabYear(self, year, direction='import', kind='HS', save_folder=None,
+                  allow_large_download=False, request_timeout=30):
         """
         Download all the files of a given year into a zip file.
 
@@ -61,8 +63,15 @@ class CustomsGrabber():
         direction : ['import', 'export']
             whether we need the data of trade to Japan (import) or
             from Japan (export).
+        kind : ['HS', 'PC']
+            whether we need the data classified under HS or PC.
         save_folder : string
             the path to the saving folder.
+        allow_large_download : bool, optional
+            Set to True to allow downloads that require multiple requests
+            (more than 100 files). Defaults to False.
+        request_timeout : int, optional
+            Timeout (seconds) for HTTP requests. Defaults to 30 seconds.
 
         Raises
         ------
@@ -71,11 +80,14 @@ class CustomsGrabber():
             and self.last.
 
         """
-        return self.grabRange(year, year, direction='import',
-                              kind='HS', save_folder=None)
+        return self.grabRange(year, year, direction=direction, kind=kind,
+                              save_folder=save_folder,
+                              allow_large_download=allow_large_download,
+                              request_timeout=request_timeout)
 
     def grabRange(self, from_year, to_year,
-                  direction='import', kind='HS', save_folder=None):
+                  direction='import', kind='HS', save_folder=None,
+                  allow_large_download=False, request_timeout=30):
         """
         Download all the files in a given range of years.
 
@@ -88,8 +100,15 @@ class CustomsGrabber():
         direction : ['import', 'export']
             whether we need the data of trade to Japan (import) or
             from Japan (export).
+        kind : ['HS', 'PC']
+            whether we need the data classified under HS or PC.
         save_folder : string
             the path to the saving folder.
+        allow_large_download : bool, optional
+            Set to True to allow downloads that require multiple requests
+            (more than 100 files). Defaults to False.
+        request_timeout : int, optional
+            Timeout (seconds) for HTTP requests. Defaults to 30 seconds.
 
         Raises
         ------
@@ -112,9 +131,9 @@ class CustomsGrabber():
                           year_param,
                           self.dir_params[kind][direction]])
 
-            year_page = requests.get(query).content
-
-            year_html = BeautifulSoup(year_page)
+            year_response = requests.get(query, timeout=request_timeout)
+            year_response.raise_for_status()
+            year_html = BeautifulSoup(year_response.content, "html.parser")
             file_links = year_html.find_all("a",
                                             attrs={"data-file_type": "CSV"})
 
@@ -125,18 +144,14 @@ class CustomsGrabber():
 
         if save_folder is None:
             save_folder = self.save_folder
+        os.makedirs(save_folder, exist_ok=True)
 
         # if there are too many files the GET request becomes too long
         # (the limit is 2048 characters) and we need to split it.
         num_splits = (len(files) // 100) + 1
-        if num_splits > 1:
-            resp = input(f"You are going to download more than\
-                         {100 * (num_splits - 1)} files. \
-                             This is going to take several minutes.\
-                                 Do you want to continue? (y/n)")
-            if resp.lower() == 'n':
-                print("Aborting download... Stopping the program.")
-                return
+        if num_splits > 1 and not allow_large_download:
+            raise ValueError("Download exceeds 100 files. Set "
+                             "allow_large_download=True to proceed.")
 
         for i in range(num_splits):
             # create chunk of max 100 files
@@ -144,18 +159,27 @@ class CustomsGrabber():
 
             # compose and send get request
             file_request_url = self.file_address + ",".join(files_chunk)
-            zipped_year_response = requests.get(file_request_url)
+            print(f"Downloading chunk {i + 1}/{num_splits} with"
+                  f" {len(files_chunk)} files (years {from_year}-{to_year}).")
+            zipped_year_response = requests.get(file_request_url,
+                                                stream=True,
+                                                timeout=request_timeout)
+            zipped_year_response.raise_for_status()
 
             # save the zip file
             if num_splits == 1:
                 file_name = f"{direction}_{kind}_{from_year}-{to_year}.zip"
             else:
                 file_name = f"{direction}_{kind}_{from_year}-{to_year}_{i}.zip"
-            with open(self.save_folder + file_name, 'wb') as f:
-                f.write(zipped_year_response.content)
-            print(f"Saving the data as {file_name} in {save_folder}.")
+            file_path = os.path.join(save_folder, file_name)
+            with open(file_path, 'wb') as f:
+                for chunk in zipped_year_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            print(f"Saved the data as {file_path}.")
 
-    def grabAll(self, direction='import', kind='HS', save_folder=None):
+    def grabAll(self, direction='import', kind='HS', save_folder=None,
+                allow_large_download=False, request_timeout=30):
         """
         Download all the files from all available years.
 
@@ -164,13 +188,24 @@ class CustomsGrabber():
         direction : ['import', 'export']
             whether we need the data of trade to Japan (import) or
             from Japan (export).
+        kind : ['HS', 'PC']
+            whether we need the data classified under HS or PC.
         save_folder : string
             the path to the saving folder.
+        allow_large_download : bool, optional
+            Set to True to allow downloads that require multiple requests
+            (more than 100 files). Defaults to False.
+        request_timeout : int, optional
+            Timeout (seconds) for HTTP requests. Defaults to 30 seconds.
 
         """
-        self._grabRange(self.first, self.last, direction, save_folder)
+        self.grabRange(self.first, self.last, direction=direction, kind=kind,
+                       save_folder=save_folder,
+                       allow_large_download=allow_large_download,
+                       request_timeout=request_timeout)
 
-    def getLastData(self, direction='import', kind='HS', save_folder=None):
+    def getLastData(self, direction='import', kind='HS', save_folder=None,
+                    allow_large_download=False, request_timeout=30):
         """
         Download the file relative to the current year.
 
@@ -179,8 +214,18 @@ class CustomsGrabber():
         direction : ['import', 'export']
             whether we need the data of trade to Japan (import) or
             from Japan (export).
+        kind : ['HS', 'PC']
+            whether we need the data classified under HS or PC.
         save_folder : string
             the path to the saving folder.
+        allow_large_download : bool, optional
+            Set to True to allow downloads that require multiple requests
+            (more than 100 files). Defaults to False.
+        request_timeout : int, optional
+            Timeout (seconds) for HTTP requests. Defaults to 30 seconds.
 
         """
-        self._grabYear(self.last)
+        self._grabYear(self.last, direction=direction, kind=kind,
+                       save_folder=save_folder,
+                       allow_large_download=allow_large_download,
+                       request_timeout=request_timeout)
