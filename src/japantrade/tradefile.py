@@ -17,7 +17,6 @@ import logging
 import pandas as pd
 import zipfile as zfile
 from time import time
-from io import StringIO
 
 MONTH_DICT = {'Jan': "01", 'Feb': "02", 'Mar': "03", 'Apr': "04",
               'May': "05", 'Jun': "06", 'Jul': "07", 'Aug': "08",
@@ -99,6 +98,7 @@ the data.
         self.chunk_size = chunk_size
         self.persist_path = persist_path
         self.persist_format = persist_format
+        self.latest_timings = []
 
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
@@ -171,6 +171,7 @@ the data.
         raw_stream = self._openRawData(file, chunk_size=chunk_size)
         processed_chunks = []
         inferred_kind = None
+        self.latest_timings = []
         for idx, chunk in enumerate(raw_stream):
             if inferred_kind is None:
                 inferred_kind = self._infer_kind(chunk)
@@ -178,12 +179,17 @@ the data.
             else:
                 self._validate_raw_schema(chunk.columns, inferred_kind)
 
-            month_melted = self._meltMonths(chunk, inferred_kind)
-            normalized = self._meltUnits(month_melted, inferred_kind)
+            month_melted, month_timings = self._meltMonths(chunk, inferred_kind)
+            normalized, unit_timings = self._meltUnits(month_melted, inferred_kind)
             reduced = self._reduce_rows(normalized)
             reduced['kind'] = inferred_kind
             self._persist_chunk(reduced, idx)
             processed_chunks.append(reduced)
+            self.latest_timings.append({
+                'chunk_index': idx,
+                'melt_months': month_timings,
+                'melt_units': unit_timings
+            })
 
         if not processed_chunks:
             raise ValueError("No data was loaded from the provided file.")
@@ -407,7 +413,7 @@ No data were acquired.")
 monthly columns!")
             log.error("meltMonths: input dataframe has no monthly columns.")
             log.debug(f"columns of the input dataframe: {df.columns}")
-            return df
+            return df, {}
 
         print("Unpivoting the monthly columns. This might take a minute...")
 
@@ -425,10 +431,10 @@ monthly columns!")
         # x3 vs list comprehension)
         # https://stackoverflow.com/posts/30113715/revisions
         start_split = time()
-        melted[['type', 'month']] = pd.read_table(
-            StringIO(melted['variable'].to_csv(None, index=None, header=None)),
-            sep='-',
-            header=None)
+        split_columns = melted['variable'].str.split('-', n=1, expand=True)
+        if split_columns.shape[1] != 2 or split_columns.isnull().any().any():
+            raise ValueError("Found malformed monthly column identifiers during split.")
+        melted[['type', 'month']] = split_columns
         melted = melted.drop(columns=['variable'])
         end_split = time()
         split_time = end_split - start_split
@@ -459,10 +465,21 @@ monthly columns!")
         # we can now get rid of year, day and month:
         melted = melted.drop(columns=['Year', 'month'])
 
-        log.info(f"The melting took {melt_time}, the splitting {split_time}, \
-the cleaning {clean_time} and the date merging time is {date_time}.")
+        metrics = {
+            'melt_time': melt_time,
+            'split_time': split_time,
+            'clean_time': clean_time,
+            'date_merge_time': date_time
+        }
+        log.info(
+            "Timing metrics for _meltMonths | melt: %s | split: %s | clean: %s | date_merge: %s",
+            melt_time,
+            split_time,
+            clean_time,
+            date_time
+        )
 
-        return melted
+        return melted, metrics
 
     def _meltUnits(self, df, kind):
         """
@@ -484,7 +501,9 @@ the cleaning {clean_time} and the date merging time is {date_time}.")
 
         log.info("Unpivoting the metrics...")
 
-        melted = df.copy()
+        melted = df
+
+        value_cast_start = time()
 
         val_index = melted[melted.type == 'Value'].index
         if kind == 'HS':
@@ -497,10 +516,30 @@ the cleaning {clean_time} and the date merging time is {date_time}.")
             melted.loc[qty_index, 'unit'] = melted.loc[qty_index, 'Unit']
 
         melted.loc[val_index, 'unit'] = 'JPY'
-        melted.loc[val_index, 'measure'] = \
-            melted.loc[val_index, 'measure'].multiply(1000)
+        if val_index.size:
+            casted_values = pd.to_numeric(
+                melted.loc[val_index, 'measure'], errors='coerce'
+            )
+            if casted_values.isna().any():
+                raise ValueError("Value rows must contain numeric data before scaling.")
+            melted.loc[val_index, 'measure'] = casted_values.multiply(1000)
+        value_cast_end = time()
+        value_cast_time = value_cast_end - value_cast_start
+
+        unit_assignment_time = value_cast_time
+        missing_units = melted['unit'].isna() | (
+            melted['unit'].astype(str).str.strip() == ''
+        )
+        if missing_units.any():
+            sample = melted.loc[missing_units, ['type', 'date']].head().to_dict('records')
+            raise ValueError(
+                "Encountered rows with missing units after melting: "
+                f"{sample}"
+            )
+        melted['unit'] = melted['unit'].astype(str).str.strip()
 
         # these columns have been replaced by "unit", won't be useful anymore
+        rename_start = time()
         if kind == 'HS':
             melted.drop(columns=['Unit1', 'Unit2', 'type'], inplace=True)
             melted.rename(columns={'HS': 'code',
@@ -511,7 +550,19 @@ the cleaning {clean_time} and the date merging time is {date_time}.")
             melted.rename(columns={'Commodity': 'code',
                                    'Country': 'country',
                                    'measure': 'value'}, inplace=True)
-        return melted
+        rename_end = time()
+        metrics = {
+            'value_cast_time': value_cast_time,
+            'rename_time': rename_end - rename_start,
+            'unit_assignment_time': unit_assignment_time
+        }
+        log.info(
+            "Timing metrics for _meltUnits | value_cast: %s | rename: %s | unit_assignment: %s",
+            metrics['value_cast_time'],
+            metrics['rename_time'],
+            metrics['unit_assignment_time']
+        )
+        return melted, metrics
 
     def _reduce_rows(self, df):
         """
