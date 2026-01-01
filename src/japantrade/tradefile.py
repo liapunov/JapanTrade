@@ -19,6 +19,10 @@ import zipfile as zfile
 from time import time
 from io import StringIO
 
+MONTH_DICT = {'Jan': "01", 'Feb': "02", 'Mar': "03", 'Apr': "04",
+              'May': "05", 'Jun': "06", 'Jul': "07", 'Aug': "08",
+              'Sep': "09", 'Oct': "10", 'Nov': "11", 'Dec': "12"}
+
 # logging settings for file and console
 # thanks to @Escualo, https://stackoverflow.com/a/9321890
 logging.basicConfig(level=logging.DEBUG,
@@ -59,7 +63,8 @@ the data.
     """
 
     def __init__(self, source=None, raw=True, direction='import',
-                 kind='infer', base_file=None, base_df=None):
+                 kind='infer', base_file=None, base_df=None,
+                 chunk_size=50000, persist_path=None, persist_format=None):
         """
         Initialize a dataframe with a source trade file.
 
@@ -79,10 +84,21 @@ the data.
 
         base_df : string
             (optional) an existing DataFrame the source will be merged to
+        chunk_size : int
+            number of rows to load per chunk when streaming raw data
+        persist_path : str
+            optional directory where intermediate cleaned chunks will be saved
+        persist_format : str
+            optional format for persistence. Supported: 'parquet', 'feather'.
+            Only used when persist_path is provided.
         """
         if source is None:
             raise ValueError("You must specify the source file. Use raw=False\
                              if the file is already in normal form.")
+
+        self.chunk_size = chunk_size
+        self.persist_path = persist_path
+        self.persist_format = persist_format
 
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
@@ -93,10 +109,11 @@ the data.
         elif raw:
             log.warning("Warning: this operation might take more than one \
  minute if the file spans over more years.")
-            self.data, self.kind = self._dfFromRaw(source, kind)
+            self.data, self.kind = self._dfFromRaw(
+                source, kind, chunk_size=self.chunk_size)
         else:
             self.data, self.kind = self._openNormalFile(source, kind)
-        
+
 
     def _infer_kind(self, df, raw=True):
         """
@@ -134,7 +151,7 @@ the data.
                 raise ValueError(f"_infer_kind: the 'kind' column is dirty.\n\
                                  Values in the column: {kinds}")
 
-    def _dfFromRaw(self, file, kind):
+    def _dfFromRaw(self, file, kind, chunk_size=50000):
         """
         Normalize raw trade data into a dataframe.
 
@@ -142,6 +159,8 @@ the data.
         ----------
         file : string
             the path of the raw trade file.
+        chunk_size : int
+            number of rows to process per chunk
 
         Returns
         ----------
@@ -149,13 +168,28 @@ the data.
             a Pandas Dataframe with normalized columns.
         """
         print(f"Opening {file}...")
-        raw = self._openRawData(file)
-        kind = self._infer_kind(raw)
-        month_melted = self._meltMonths(raw, kind)
-        normalized = self._meltUnits(month_melted, kind)
-        reduced = self._reduce_rows(normalized)
-        reduced['kind'] = kind
-        return reduced, kind
+        raw_stream = self._openRawData(file, chunk_size=chunk_size)
+        processed_chunks = []
+        inferred_kind = None
+        for idx, chunk in enumerate(raw_stream):
+            if inferred_kind is None:
+                inferred_kind = self._infer_kind(chunk)
+                self._validate_raw_schema(chunk.columns, inferred_kind)
+            else:
+                self._validate_raw_schema(chunk.columns, inferred_kind)
+
+            month_melted = self._meltMonths(chunk, inferred_kind)
+            normalized = self._meltUnits(month_melted, inferred_kind)
+            reduced = self._reduce_rows(normalized)
+            reduced['kind'] = inferred_kind
+            self._persist_chunk(reduced, idx)
+            processed_chunks.append(reduced)
+
+        if not processed_chunks:
+            raise ValueError("No data was loaded from the provided file.")
+
+        combined = pd.concat(processed_chunks, axis=0, ignore_index=True)
+        return combined, inferred_kind
 
     def _opener(self):
         # identifying the right function to call the right function
@@ -181,7 +215,83 @@ the data.
             df = self._cleanDataFile(df)
         return df
 
-    def _openRawData(self, filename):
+    def _validate_raw_schema(self, columns, kind):
+        base_columns = {'Year', 'Country'}
+        if kind == 'HS':
+            base_columns.update({'HS', 'Unit1', 'Unit2'})
+            expected_types = ['Quantity1', 'Quantity2', 'Value']
+        else:
+            base_columns.update({'Commodity', 'Unit'})
+            expected_types = ['Quantity', 'Value']
+
+        missing_base = base_columns.difference(columns)
+        if missing_base:
+            raise ValueError(f"Missing required column(s): {sorted(missing_base)}")
+
+        missing_months = []
+        for measure_type in expected_types:
+            for month_name in MONTH_DICT.keys():
+                column_name = f"{measure_type}-{month_name}"
+                if column_name not in columns:
+                    missing_months.append(column_name)
+
+        if missing_months:
+            raise ValueError(
+                "The file is missing expected monthly measure columns. "
+                f"Missing: {missing_months}"
+            )
+
+        return True
+
+    def _stream_raw_chunks(self, filename, trade_types, chunk_size):
+        if filename.endswith('.zip'):
+            with zfile.ZipFile(filename) as z:
+                for f in z.namelist():
+                    if f.endswith(".csv"):
+                        with z.open(f) as piece:
+                            total_rows = 0
+                            for i, chunk in enumerate(pd.read_csv(
+                                    piece, dtype=trade_types,
+                                    chunksize=chunk_size)):
+                                total_rows += len(chunk)
+                                log.info(f"Loaded chunk {i+1} from {f} with "
+                                         f"{len(chunk)} rows (total {total_rows}).")
+                                yield chunk
+        else:
+            total_rows = 0
+            for i, chunk in enumerate(pd.read_csv(
+                    filename, dtype=trade_types, chunksize=chunk_size)):
+                total_rows += len(chunk)
+                log.info(f"Loaded chunk {i+1} from {filename} with "
+                         f"{len(chunk)} rows (total {total_rows}).")
+                yield chunk
+
+    def _persist_chunk(self, df, chunk_index):
+        if not self.persist_path:
+            return
+
+        os.makedirs(self.persist_path, exist_ok=True)
+        persist_format = (self.persist_format or 'parquet').lower()
+
+        if persist_format == 'parquet':
+            extension = 'parquet'
+            df.to_parquet(
+                os.path.join(
+                    self.persist_path, f"clean_chunk_{chunk_index}.{extension}"
+                ),
+                index=False
+            )
+        elif persist_format == 'feather':
+            extension = 'feather'
+            df.reset_index(drop=True).to_feather(
+                os.path.join(
+                    self.persist_path, f"clean_chunk_{chunk_index}.{extension}"
+                )
+            )
+        else:
+            raise ValueError("Unsupported persist_format. Use 'parquet' or 'feather'.")
+
+    def _openRawData(self, filename, chunk_size=None):
         """
         Open a zip or a csv file containing raw trade data from customs.go.jp.
 
@@ -196,9 +306,8 @@ the data.
         three letters
         (capitalized) of a specific month, e.g. "Jan", "Aug" etc.
         In case the file is a zip with multiple csv files, the function opens
-        and merges
-        the files into a single DataFrame object, which the function returns.
-        If the file is a single csv, return the DataFrame built from it.
+        and streams each file in chunks, yielding cleaned DataFrames one by one.
+        If the file is a single csv, it is streamed in chunks as well.
 
         """
         trade_types = {'Year': 'string', 'HS': 'category',
@@ -206,12 +315,12 @@ the data.
                        'Unit1': 'category', 'Unit2': 'category',
                        'Unit': 'category'}
 
-        def merge(frame1, frame2):
-            return frame1.append(frame2, ignore_index=True)
+        print("Loading the file in streaming mode...")
+        chunksize = chunk_size or self.chunk_size
 
-        print("Loading the file...")
-
-        return self._opener()[filename[-3:]](filename, trade_types, raw=True)
+        for chunk in self._stream_raw_chunks(filename, trade_types, chunksize):
+            cleaned = self._cleanDataFile(chunk)
+            yield cleaned
 
     def _cleanDataFile(self, df):
         """Clean the dataframe acquired from the raw data."""
@@ -292,12 +401,6 @@ No data were acquired.")
           "Quantity2", "Value"
         - "measure", with the value associated to the type
         """
-        # this dictionary will be useful to convert the months from words
-        # to digits
-        month_dict = {'Jan': "01", 'Feb': "02", 'Mar': "03", 'Apr': "04",
-                      'May': "05", 'Jun': "06", 'Jul': "07", 'Aug': "08",
-                      'Sep': "09", 'Oct': "10", 'Nov': "11", 'Dec': "12"}
-
         # a very lousy check but a check nontheless...
         if len(df.columns) < 20:
             log.error("meltMonths: the dataframe provided does not have \
@@ -348,7 +451,7 @@ monthly columns!")
 
         # now, merging creating a datetime column from the year and the month
         start_date = time()
-        melted['month'] = melted['month'].replace(month_dict)
+        melted['month'] = melted['month'].replace(MONTH_DICT)
         melted['date'] = melted['Year'] + "-" + melted['month'] + "-01"
         end_date = time()
         date_time = end_date - start_date
@@ -454,12 +557,15 @@ the cleaning {clean_time} and the date merging time is {date_time}.")
                 log.warning("TradeFile.acquireNewData: both df and csv \
 files were provided as merge parameters. The dataframe will be ignored.")
             # normalize the new file
-            new_data, kind = self._dfFromRaw(new_file, kind)
+            new_data, kind = self._dfFromRaw(
+                new_file, kind, chunk_size=self.chunk_size)
             # merge to the existing dataframe
-            updated_df = self.data.append(new_data).drop_duplicates()
+            updated_df = pd.concat([self.data, new_data], ignore_index=True)\
+                .drop_duplicates()
         elif new_df is not None:
             # merge to the existing file
-            updated_df = self.data.append(new_df).drop_duplicates()
+            updated_df = pd.concat([self.data, new_df], ignore_index=True)\
+                .drop_duplicates()
         else:
             # no file or DataFrame to merge with
             return self.data
