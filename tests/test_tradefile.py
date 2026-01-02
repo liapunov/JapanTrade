@@ -1,11 +1,15 @@
+import logging
+
 import pandas as pd
 import pytest
 
-from japantrade.tradefile import TradeFile
+from japantrade.tradefile import NormalizationConfig, TradeFile
 
 
-def _build_tradefile():
+def _build_tradefile(config: NormalizationConfig | None = None):
     tradefile = TradeFile.__new__(TradeFile)
+    tradefile.normalization_config = config or NormalizationConfig()
+    tradefile._lookup_cache = {}
     tradefile.persist_path = None
     tradefile.persist_format = None
     tradefile.chunk_size = 50000
@@ -172,3 +176,47 @@ def test_save_to_file_with_custom_filename_and_parquet(tmp_path):
     assert target.exists()
     saved = pd.read_parquet(target)
     assert len(saved) == len(tf.data)
+
+
+def test_normalize_units_conversion_and_filtering(caplog):
+    config = NormalizationConfig(convert_to_base_units=True, keep_units=("KG", "NO"), warn_on_unknown=True)
+    tf = _build_tradefile(config)
+    df = pd.DataFrame(
+        {
+            "unit": ["kg", "th", "UNK"],
+            "value": [1, 2, 3],
+            "code": ["0000"] * 3,
+            "country": ["000"] * 3,
+            "date": ["2023-01-01"] * 3,
+            "kind": ["HS"] * 3,
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        normalized, metrics = tf._normalize_units(df)
+    assert set(normalized["unit"]) == {"KG", "NO"}
+    assert normalized.loc[normalized["unit"] == "NO", "value"].iloc[0] == 2000
+    assert metrics["unit_conversions"] == 1
+    assert metrics["filtered_rows"] == 1
+    assert any("unknown unit codes" in record.message for record in caplog.records)
+
+
+def test_enrich_with_lookup_cache(tmp_path):
+    config = NormalizationConfig(include_descriptions=True, warn_on_unknown=False)
+    tf = _build_tradefile(config)
+    df = pd.DataFrame(
+        {
+            "code": ["0101"],
+            "country": ["103"],
+            "unit": ["KG"],
+            "date": ["2023-01-01"],
+            "value": [100],
+            "kind": ["HS"],
+        }
+    )
+    enriched, metrics = tf._enrich_with_lookups(df, "HS")
+    assert "code_description" in enriched.columns
+    assert "country_name" in enriched.columns
+    assert "hs" in tf._lookup_cache
+    # second call should reuse cache and preserve metrics shape
+    enriched_again, metrics_again = tf._enrich_with_lookups(df, "HS")
+    assert metrics_again.keys() == metrics.keys()
