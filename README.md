@@ -19,6 +19,11 @@ What we are trying to do here is:
 - `notebooks/trend_analysis_template.ipynb` demonstrates common visualizations (line, bar, treemap) using the analytics helpers.
 - `notebooks/query_export_template.ipynb` shows how to export to DuckDB/SQLite and run the provided example queries.
 
+## CLI filtering and aggregates
+- A lightweight CLI is available via `python -m japantrade.cli <normalized.csv>` with filters for country lists/prefixes, HS/PC code prefixes, units, and optional date bounds.
+- Add `--aggregate mom`/`--aggregate yoy`/`--aggregate trailing12` to compute growth metrics once the filtered dataset includes the required monthly coverage.
+- Use `--output` to persist filtered rows to CSV while printing a quick preview to stdout.
+
 ## Available modules as of March 24, 2021
 - Japanese_HS_Codes.ipynb: extract the 4, 6 and 9 lengths HS (harmonized system) codes and descriptions from a static csv table.
 - customsgrabber.py: tools for fetching trade data from the customs.or.jp website 

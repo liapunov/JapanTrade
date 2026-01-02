@@ -15,8 +15,8 @@ This module contains a single class, TradeFile.
 # coding: utf-8
 
 from __future__ import print_function
-import pandas as pd
 import logging
+import pandas as pd
 from tradefile import TradeFile as trf
 
 
@@ -137,6 +137,24 @@ class TradeReport():
     def _dates_exist(self, start_date, end_date):
         return start_date >= self.first_date and end_date <= self.last_date
 
+    def _validate_month_coverage(self, start_date: pd.Timestamp, end_date: pd.Timestamp, kind: str, country: str):
+        start_period = start_date.to_period("M")
+        end_period = end_date.to_period("M")
+        expected = pd.period_range(start=start_period, end=end_period, freq="M")
+        subset = self.trade_df.loc[(kind,
+                                    slice(start_date, end_date),
+                                    country,
+                                    slice(None),
+                                    slice(None))]
+        available = subset.index.get_level_values('date').to_period("M").unique()
+        missing = [period for period in expected if period not in available]
+        if missing:
+            missing_str = ", ".join(period.strftime("%Y-%m") for period in missing)
+            raise ValueError(
+                f"Cannot use this method: missing data for months {missing_str} "
+                f"for country {country} and kind {kind}."
+            )
+
     def _country_exists(self, country):
         return int(country) in self.trade_df.index.get_level_values('country')
 
@@ -202,14 +220,15 @@ two quantities.
         # do we have all that we need?
         # check the periods first.
         if method == 'curr_year':
-            end_date = self.last_date
-            start_date = pd.datetime(f"{self.last_date.year()}-1-1")
+            end_date = pd.Timestamp(year=self.last_date.year, month=self.last_date.month, day=1)
+            start_date = pd.Timestamp(year=end_date.year, month=1, day=1)
         elif method == 'last_year':
-            end_date = pd.datetime(f"{self.last_date.year-1}-12-1")
-            start_date = pd.datetime(f"{self.last_date.year-1}-1-1")
+            target_year = self.last_date.year - 1
+            end_date = pd.Timestamp(year=target_year, month=12, day=1)
+            start_date = pd.Timestamp(year=target_year, month=1, day=1)
         elif method == 'last_12':
-            end_date = self.last_date
-            start_date = end_date - pd.DateOffset(months=12)
+            end_date = pd.Timestamp(year=self.last_date.year, month=self.last_date.month, day=1)
+            start_date = end_date - pd.DateOffset(months=11)
         else:
             raise ValueError(f"Unknown method: {method}")
         if not self._dates_exist(start_date, end_date):
@@ -217,6 +236,7 @@ two quantities.
         # check the country
         if not self._country_exists(country):
             raise ValueError(f"Country code {country} does not exist")
+        self._validate_month_coverage(start_date, end_date, kind, country)
 
         # time to drill down the dataframe.
         # make sure to select only the codes with length>=code_level

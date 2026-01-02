@@ -90,7 +90,11 @@ def run(data_path: Path | str = DEFAULT_DATA_PATH) -> None:
     )
     st.metric("Total value", f"{filtered['value'].sum():,.0f}")
 
-    trends = year_over_year_trends(filtered)
+    try:
+        trends = year_over_year_trends(filtered)
+    except ValueError as exc:
+        st.warning(str(exc))
+        trends = pd.DataFrame()
     if not trends.empty:
         st.altair_chart(yoy_chart(trends.dropna(subset=["yoy_value"])), use_container_width=True)
     else:
