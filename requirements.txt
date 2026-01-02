@@ -2,7 +2,12 @@
 beautifulsoup4
 numpy
 requests
-seaborne
+seaborn
+altair
+duckdb
+streamlit
+panel
+plotly
 
 ###### Requirements with Version Specifiers ######
 pandas >= 1.0.0
