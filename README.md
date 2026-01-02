@@ -1,44 +1,144 @@
 # JapanTrade
-Growing repository of tools for analyzing Japanese customs trade data.
-Python / Pandas + Seaborn
-The biggest problem in working with Japanese Customs data is that, as of April 2020, there does not seem to be an easily accesible API for the trade data - indeed, there is no easy way to slice any piece of information from the website, which only provides csv tables divided by months and including only part of the HS (Harmonized System) codes in each file.
-What we are trying to do here is:
-- First of all, starting from single csv files, obtain a highly normalized version of the time series
-- secondly, extract and normalize the description of each HS code, as the codes descriptions are often distributed hierarchically over many lines of a csv or worse, HTML table.
-- finally, create a few methods to extract common queries, such as the comparison year-on-year of a specific HS code for a specific country, or the chart of the time series for a specific HS code and a group of countries.
 
-## Streamlit explorer and SQL exports
-- A lightweight Streamlit app (`src/japantrade/app.py`) loads normalized datasets, provides filters for kind/country/code/unit/date, and visualizes YoY trends, top products, and country comparisons. Launch with:
-  ```
-  streamlit run src/japantrade/app.py
-  ```
-- DuckDB/SQLite exports and example parameterized queries live in `japantrade.exporters` and are demonstrated in the app as well as `notebooks/query_export_template.ipynb`.
-- `tests/fixtures/normalized_sample.csv` is a minimal fixture dataset that powers notebook examples and CI smoke checks.
+Tools for acquiring, cleaning, and analyzing Japanese customs trade data when no official API is available. The library focuses on:
 
-## Notebook templates
-- `notebooks/trend_analysis_template.ipynb` demonstrates common visualizations (line, bar, treemap) using the analytics helpers.
-- `notebooks/query_export_template.ipynb` shows how to export to DuckDB/SQLite and run the provided example queries.
+* Downloading monthly CSV releases from the customs repository.
+* Normalizing wide monthly tables into long, analysis-ready data.
+* Producing quick exploratory reports and notebook examples.
 
-## CLI filtering and aggregates
-- A lightweight CLI is available via `python -m japantrade.cli <normalized.csv>` with filters for country lists/prefixes, HS/PC code prefixes, units, and optional date bounds.
-- Add `--aggregate mom`/`--aggregate yoy`/`--aggregate trailing12` to compute growth metrics once the filtered dataset includes the required monthly coverage.
-- Use `--output` to persist filtered rows to CSV while printing a quick preview to stdout.
+> Note: The repository currently ships Python tools and research notebooks. It does **not** yet expose a public web UI or CLI—see the roadmap for planned extensions.
 
-## Available modules as of March 24, 2021
-- Japanese_HS_Codes.ipynb: extract the 4, 6 and 9 lengths HS (harmonized system) codes and descriptions from a static csv table.
-- customsgrabber.py: tools for fetching trade data from the customs.or.jp website 
-- tradefile.py: tools for extracting, merging and normalising into a pandas DF the trade data csv tables that the customs.or.jp website provides
-- tradeanalysis.py: tools for creating useful tables and charts from a preprocessed trade data frame
+## Repository layout
 
-## Next To Do as of March 24, 2021
-- tradeanalysis.py: refactor TradeReport.yoy_country_report; develop TradeReport.comparison_chart_by_country
-- Refactor the Japanese_HS_codes.ipynb module
-- Package the modules
+| Path | Purpose |
+| --- | --- |
+| `src/japantrade/customsgrabber.py` | Download helper for monthly customs CSV archives (import/export, HS/PC classification). |
+| `src/japantrade/tradefile.py` | Normalizes raw CSV/ZIP exports into a tidy pandas DataFrame. |
+| `src/japantrade/tradeanalysis.py` | Lightweight reporting utilities on top of normalized data. |
+| `src/japantrade/Trade Tools.ipynb` | End-to-end examples: download → normalize → basic visuals. |
+| `src/japantrade/Trade data analysis.ipynb` | Exploratory analysis on normalized datasets. |
+| `Japanese_HS_Codes.ipynb` | HS code description extraction from static tables. |
 
-# Development plan
-- Tools for adding HS/PC code descriptions from the HTML tables available in the customs.or.jp website, in particular:
--- The assertions are still missing
--- The textual descriptions have not been included yet
-- TradeReport.comparison_chart_by_country, in order to compare and chart the trend of a given code for different countries
-- Tools for finding an HS code by textual approximate search (NLP module will be needed)
-- Web servicization with Flask
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Pandas and BeautifulSoup are required for the core workflow. Jupyter is recommended for running the bundled notebooks.
+
+## Data acquisition: `CustomsGrabber`
+
+Located in `src/japantrade/customsgrabber.py`, `CustomsGrabber` automates downloads from the customs portal.
+
+### Key parameters
+
+* `direction`: `"import"` or `"export"`.
+* `kind`: `"HS"` (Harmonized System) or `"PC"` (Japanese product classification).
+* `from_year`, `to_year`: inclusive year bounds (≥1988, current year capped).
+* `save_folder`: where ZIP files are written (defaults to `../data/` relative to the module).
+
+### Usage examples
+
+```python
+from japantrade.customsgrabber import CustomsGrabber
+
+grabber = CustomsGrabber()
+# Download a single year of HS import data
+grabber.grabRange(from_year=2022, to_year=2022, direction="import", kind="HS", save_folder="./data/")
+
+# Fetch the latest available year
+grabber.getLastData(direction="export", kind="PC", save_folder="./data/")
+```
+
+The downloader batches requests in chunks of up to 100 files to keep URLs below server limits. It saves ZIP archives you can pass directly to `TradeFile`.
+
+## Data normalization: `TradeFile`
+
+`TradeFile` (in `src/japantrade/tradefile.py`) converts raw customs CSVs or ZIP bundles into long-form pandas DataFrames.
+
+### What it does
+
+1. **Cleaning** – fixes known column typos (e.g., `Apl` → `Apr`), strips code artifacts, drops yearly totals.
+2. **Month unpivot** – melts `Quantity1/Quantity2/Value` columns across months into a `date/type/measure` layout.
+3. **Unit unpivot** – consolidates multiple units into a single `unit` column and standardizes currency to JPY (×1000).
+4. **Row reduction** – removes zero or missing values for a compact, analysis-ready table.
+
+### Creating a normalized DataFrame
+
+```python
+from japantrade.tradefile import TradeFile
+
+normalized = TradeFile(
+    source="./data/import_HS_2022.zip",  # raw CSV or ZIP
+    raw=True,                            # set to False if already normalized
+    kind="infer"                         # infer HS vs PC from columns
+)
+df = normalized.data  # columns: kind, country, code, date, unit, value
+```
+
+### Merging additional files
+
+`TradeFile` accepts an existing normalized CSV/ZIP (`base_file`) or DataFrame (`base_df`) and will append deduplicated new rows:
+
+```python
+base = "./data/normalized_2019_2021.csv"
+merged = TradeFile(source="./data/import_HS_2022.zip", base_file=base)
+merged.save_to_file(path="./data/normalized_2019_2022.csv", is_zip=False)
+```
+
+## Reporting and exploration: `TradeReport`
+
+`TradeReport` (in `src/japantrade/tradeanalysis.py`) provides lightweight analysis helpers on normalized data.
+
+### Current capability
+
+* **YoY country reports**: `yoy_country_report(kind="HS", country="220", method="last_12")` compares the latest 12 months to the prior period, optionally filtering by code length and units.
+
+### Example
+
+```python
+from japantrade.tradeanalysis import TradeReport
+
+report = TradeReport(source_file="./data/normalized_2019_2022.csv")
+italy_yoy = report.yoy_country_report(
+    kind="HS",
+    country="220",        # Italy
+    code_level=4,         # min code length
+    val_only=True,        # value (JPY) only
+    method="last_12"      # trailing 12 months vs prior 12
+)
+```
+
+The returned DataFrame is indexed by HS/PC code and unit, with trailing and prior-period sums ready for visualization in pandas/Seaborn/Matplotlib.
+
+## Notebooks at a glance
+
+* **`src/japantrade/Trade Tools.ipynb`** – Walks through downloading data, normalizing it with `TradeFile`, and running first-pass plots.
+* **`src/japantrade/Trade data analysis.ipynb`** – Deeper exploratory analysis on prepared datasets (country/code slices, trend charts).
+* **`Japanese_HS_Codes.ipynb`** – Extracts HS code descriptions from provided tables, demonstrating code-to-description enrichment.
+
+Open notebooks with:
+
+```bash
+jupyter notebook src/japantrade/Trade\ Tools.ipynb
+```
+
+## Recent updates
+
+* Clarified how `CustomsGrabber` chunks downloads and parameterizes direction/kind.
+* Documented the full normalization pipeline in `TradeFile` (clean → melt months → melt units → reduce).
+* Added end-to-end notebook references for common workflows.
+
+## Ideas and roadmap
+
+* Harden downloading: add timeouts, retries, non-interactive flags, and stream-to-disk support for very large batches.
+* Optimize transforms: chunked CSV reads, stricter schema validation, faster melts, and Parquet/Feather outputs.
+* Enrich data: join HS/PC and country descriptions; standardize units with optional conversions.
+* Broader analytics: multi-country comparisons, MoM/YoY helpers, and guardrails for incomplete monthly coverage.
+* Interfaces: lightweight CLI for filtering/aggregation and a simple dashboard (e.g., Streamlit/Panel) for interactive exploration.
+* Testing: small fixture datasets plus unit tests for cleaning, melts, and report edge cases.
+
+Contributions and issue reports are welcome—especially around performance tuning, schema validation, and visualization recipes.
