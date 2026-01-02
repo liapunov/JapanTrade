@@ -22,7 +22,17 @@ class FilterOptions:
 
 def load_normalized_data(source: str | io.BytesIO | io.StringIO) -> pd.DataFrame:
     """Load normalized trade data from csv-like sources."""
-    df = pd.read_csv(source)
+    df = pd.read_csv(
+        source,
+        dtype={
+            "kind": str,
+            "country": str,
+            "code": str,
+            "unit": str,
+            "date": str,
+            "value": "float64",
+        },
+    )
     expected_cols = {"kind", "country", "code", "date", "unit", "value"}
     missing = expected_cols - set(df.columns)
     if missing:
