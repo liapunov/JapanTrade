@@ -8,6 +8,7 @@ duckdb
 streamlit
 panel
 plotly
+pytest
 
 ###### Requirements with Version Specifiers ######
 pandas >= 1.0.0
