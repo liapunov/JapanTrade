@@ -293,7 +293,7 @@ the data.
             self.data, self.kind = self._openNormalFile(source, kind)
             self.data = self._ensure_kind_column(self.data, self.kind)
 
-    def _ensure_kind_column(self, df, kind):
+    def _ensure_kind_column(self, df, kind, update_attr: bool = True):
         """Ensure the dataframe contains a consistent 'kind' column."""
         inferred_kind = kind
         if 'kind' not in df.columns:
@@ -320,7 +320,8 @@ the data.
                     f"found {existing_kinds}"
                 )
             inferred_kind = existing_kinds.pop()
-        self.kind = inferred_kind
+        if update_attr:
+            self.kind = inferred_kind
         return df
 
     def _load_tqdm(self):
@@ -774,13 +775,6 @@ No data were acquired.")
         - "measure", with the value associated to the type
         """
         # a very lousy check but a check nontheless...
-        if len(df.columns) < 20:
-            log.error("meltMonths: the dataframe provided does not have \
-monthly columns!")
-            log.error("meltMonths: input dataframe has no monthly columns.")
-            log.debug(f"columns of the input dataframe: {df.columns}")
-            return df, {}
-
         print("Unpivoting the monthly columns. This might take a minute...")
 
         if kind == 'HS':
@@ -867,18 +861,18 @@ monthly columns!")
 
         log.info("Unpivoting the metrics...")
 
-        melted = df
+        melted = df.copy()
 
         value_cast_start = time()
 
-        val_index = melted[melted.type == 'Value'].index
+        val_index = melted[melted["type"] == 'Value'].index
         if kind == 'HS':
-            qty1_index = melted[melted.type == 'Quantity1'].index
-            qty2_index = melted[melted.type == 'Quantity2'].index
+            qty1_index = melted[melted["type"] == 'Quantity1'].index
+            qty2_index = melted[melted["type"] == 'Quantity2'].index
             melted.loc[qty1_index, 'unit'] = melted.loc[qty1_index, 'Unit1']
             melted.loc[qty2_index, 'unit'] = melted.loc[qty2_index, 'Unit2']
         else:
-            qty_index = melted[melted.type == 'Quantity'].index
+            qty_index = melted[melted["type"] == 'Quantity'].index
             melted.loc[qty_index, 'unit'] = melted.loc[qty_index, 'Unit']
 
         melted.loc[val_index, 'unit'] = 'JPY'
@@ -973,6 +967,7 @@ monthly columns!")
             raise ValueError("date_range must be a tuple or list of two date strings (start, end).")
 
         base_snapshot = self._snapshot_state(self.data)
+        existing_kind = getattr(self, "kind", None)
         if new_file is not None:
             # we are giving priority to files.
             # if both a DF and a file are specified,
@@ -986,16 +981,17 @@ files were provided as merge parameters. The dataframe will be ignored.")
                 new_file, kind, chunk_size=self.chunk_size)
             new_data = self._ensure_kind_column(new_data, kind)
         elif new_df is not None:
-            new_data = self._ensure_kind_column(new_df, kind)
+            new_data = self._ensure_kind_column(new_df, kind, update_attr=False)
         else:
             # no file or DataFrame to merge with
             return self.data
-        if self.kind not in ['infer', None] and self.kind != self._infer_kind(new_data, raw=False):
+        incoming_kind = self._infer_kind(new_data, raw=False)
+        if existing_kind not in ['infer', None] and existing_kind != incoming_kind:
             raise ValueError(
-                f"Inconsistent kind when merging. Existing kind: {self.kind}, "
-                f"new data kind: {self._infer_kind(new_data, raw=False)}"
+                f"Inconsistent kind when merging. Existing kind: {existing_kind}, "
+                f"new data kind: {incoming_kind}"
             )
-        self.kind = self._infer_kind(new_data, raw=False)
+        self.kind = incoming_kind
 
         if date_range:
             start_date, end_date = date_range
@@ -1036,6 +1032,8 @@ files were provided as merge parameters. The dataframe will be ignored.")
         Path
             The path where the file was saved.
         """
+        if not hasattr(self, "normalization_config") or self.normalization_config is None:
+            self.normalization_config = NormalizationConfig()
         resolved_fmt = fmt.lower() if fmt else None
         if resolved_fmt and resolved_fmt not in self.normalization_config.output_formats:
             raise ValueError(
