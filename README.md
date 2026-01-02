@@ -1,12 +1,12 @@
 # JapanTrade
 
-Tools for acquiring, cleaning, and analyzing Japanese customs trade data when no official API is available. The library focuses on:
+Tools for acquiring, cleaning, analyzing, and interactively exploring Japanese customs trade data when no official API is available. The library focuses on:
 
 * Downloading monthly CSV releases from the customs repository.
 * Normalizing wide monthly tables into long, analysis-ready data.
-* Producing quick exploratory reports and notebook examples.
+* Producing quick exploratory reports, notebook examples, and a Streamlit dashboard for exploratory analysis.
 
-> Note: The repository currently ships Python tools and research notebooks. It does **not** yet expose a public web UI or CLI—see the roadmap for planned extensions.
+> Note: The repository ships Python tools, research notebooks, and a Streamlit app for interactive exploration. A CLI is still on the roadmap.
 
 ## Repository layout
 
@@ -17,6 +17,7 @@ Tools for acquiring, cleaning, and analyzing Japanese customs trade data when no
 | `src/japantrade/tradeanalysis.py` | Lightweight reporting utilities on top of normalized data. |
 | `src/japantrade/Trade Tools.ipynb` | End-to-end examples: download → normalize → basic visuals. |
 | `src/japantrade/Trade data analysis.ipynb` | Exploratory analysis on normalized datasets. |
+| `src/japantrade/app.py` | Streamlit "Japan Trade Explorer" dashboard backed by normalized data. |
 | `Japanese_HS_Codes.ipynb` | HS code description extraction from static tables. |
 
 ## Setup
@@ -63,8 +64,9 @@ The downloader batches requests in chunks of up to 100 files to keep URLs below 
 
 1. **Cleaning** – fixes known column typos (e.g., `Apl` → `Apr`), strips code artifacts, drops yearly totals.
 2. **Month unpivot** – melts `Quantity1/Quantity2/Value` columns across months into a `date/type/measure` layout.
-3. **Unit unpivot** – consolidates multiple units into a single `unit` column and standardizes currency to JPY (×1000).
-4. **Row reduction** – removes zero or missing values for a compact, analysis-ready table.
+3. **Unit unpivot + normalization** – consolidates units into a single column, canonizes codes (e.g., `KGS` → `KG`), optionally converts base units (e.g., thousands → absolute counts), and supports keep/exclude lists with warnings on unknowns.
+4. **Enrichment** – reuses cached HS/PC and country lookup files (configurable overrides) to attach descriptions during batch processing.
+5. **Row reduction** – removes zero or missing values for a compact, analysis-ready table.
 
 ### Creating a normalized DataFrame
 
@@ -114,6 +116,27 @@ italy_yoy = report.yoy_country_report(
 
 The returned DataFrame is indexed by HS/PC code and unit, with trailing and prior-period sums ready for visualization in pandas/Seaborn/Matplotlib.
 
+## Streamlit app: Japan Trade Explorer
+
+The Streamlit dashboard (`src/japantrade/app.py`) ships with a bundled fixture (`tests/fixtures/normalized_sample.csv`) so you can explore immediately or upload your own normalized CSV.
+
+### Launch
+
+```bash
+streamlit run src/japantrade/app.py
+```
+
+### Features
+
+* **Data loading**: Upload normalized CSVs or rely on the bundled sample; data is validated via `load_normalized_data`.
+* **Filtering**: Sidebar controls for kind, countries, codes, units, and date range (auto-populated from available data).
+* **Summary metrics**: Total value KPI for the active filter set.
+* **Trends**: Year-over-year trend chart with validation for minimum monthly coverage.
+* **Top products**: Tabular and Altair bar views of top codes by value, plus a Plotly treemap for relative magnitude.
+* **Country comparison**: Aggregates by country (optionally scoped to a selected code) with charted results.
+* **Exports**: One-click downloads to DuckDB and SQLite files generated from the filtered dataset.
+* **Example queries**: Parameterized SQL snippets (DuckDB) such as top exporters in a date window and fastest-growing categories by year, runnable directly in-app.
+
 ## Notebooks at a glance
 
 * **`src/japantrade/Trade Tools.ipynb`** – Walks through downloading data, normalizing it with `TradeFile`, and running first-pass plots.
@@ -128,17 +151,16 @@ jupyter notebook src/japantrade/Trade\ Tools.ipynb
 
 ## Recent updates
 
-* Clarified how `CustomsGrabber` chunks downloads and parameterizes direction/kind.
-* Documented the full normalization pipeline in `TradeFile` (clean → melt months → melt units → reduce).
-* Added end-to-end notebook references for common workflows.
+* Added the Streamlit-based Japan Trade Explorer with filtering, charts, exports, and runnable example queries.
+* Expanded normalization controls (base-unit conversion, keep/exclude filters, and warnings for unknown units) and added cached lookup enrichment to the pipeline.
+* Strengthened analysis helpers (`TradeReport`, `analytics.py`) for YoY/MoM trends, trailing totals, and top-product summaries.
 
 ## Ideas and roadmap
 
-* Harden downloading: add timeouts, retries, non-interactive flags, and stream-to-disk support for very large batches.
-* Optimize transforms: chunked CSV reads, stricter schema validation, faster melts, and Parquet/Feather outputs.
-* Enrich data: join HS/PC and country descriptions; standardize units with optional conversions.
-* Broader analytics: multi-country comparisons, MoM/YoY helpers, and guardrails for incomplete monthly coverage.
-* Interfaces: lightweight CLI for filtering/aggregation and a simple dashboard (e.g., Streamlit/Panel) for interactive exploration.
-* Testing: small fixture datasets plus unit tests for cleaning, melts, and report edge cases.
+* CLI tooling: quick filters/aggregations from the terminal, plus CSV/Parquet export commands.
+* Performance: chunked CSV ingestion, faster melt paths, and Parquet/Feather outputs for large-scale workflows.
+* Automation: scheduled fetch + normalize pipelines with freshness monitoring and artifact publishing.
+* Visualization: additional Streamlit views (e.g., MoM trend comparisons, share-of-total charts) and optional alerting for large swings.
+* Data quality: richer validation with anomaly detection (e.g., outlier spikes/drops) and clearer warnings in the app/CLI.
 
 Contributions and issue reports are welcome—especially around performance tuning, schema validation, and visualization recipes.
