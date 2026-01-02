@@ -7,6 +7,8 @@ from japantrade.analytics import (
     country_comparison,
     filter_dataframe,
     load_normalized_data,
+    month_over_month_trends,
+    trailing_12_month_totals,
     top_products_by_value,
     year_over_year_trends,
 )
@@ -26,10 +28,25 @@ def test_load_and_filter_fixture():
 
 
 def test_yoy_trends_and_top_products():
-    df = load_normalized_data(FIXTURE)
-    trends = year_over_year_trends(df[df["kind"] == "HS"])
-    # At least one YoY growth value should be finite thanks to the fixture.
+    dates = pd.date_range("2022-01-01", periods=13, freq="MS")
+    df = pd.DataFrame(
+        {
+            "kind": ["HS"] * len(dates),
+            "country": ["001"] * len(dates),
+            "code": ["0101"] * len(dates),
+            "date": dates,
+            "unit": ["JPY"] * len(dates),
+            "value": [100 + i for i in range(len(dates))],
+        }
+    )
+    trends = year_over_year_trends(df)
     assert (trends["yoy_value"].notna()).any()
+    mom = month_over_month_trends(df)
+    assert mom["mom_value"].notna().any()
+    trailing = trailing_12_month_totals(df)
+    assert trailing["trailing_12_value"].notna().any()
+
+    df = load_normalized_data(FIXTURE)
     top_codes = top_products_by_value(df, top_n=3)
     assert not top_codes.empty
     assert set(top_codes.columns) == {"kind", "code", "value"}

@@ -98,7 +98,7 @@ class TradeReport():
         If the file is a single csv, return the DataFrame built from it.
         """
         pieces = []
-        trade_types = {"HS": object, "Country": object, "date": pd.datetime,
+        trade_types = {"HS": object, "Country": object, "date": pd.to_datetime,
                        "unit": object, "measure": "Int64"}
         return self.opener[filename.split(".")[-1]](filename, trade_types)
 
