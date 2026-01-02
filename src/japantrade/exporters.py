@@ -40,7 +40,7 @@ EXAMPLE_QUERIES: List[ExampleQuery] = [
         WITH by_year AS (
             SELECT
                 code,
-                CAST(strftime('%Y', CAST(date AS DATE)) AS INTEGER) AS year,
+                year,
                 SUM(value) AS total_value
             FROM {TRADE_TABLE}
             WHERE kind = ?
@@ -72,6 +72,7 @@ EXAMPLE_QUERIES: List[ExampleQuery] = [
 def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy()
     prepared["date"] = pd.to_datetime(prepared["date"])
+    prepared["year"] = prepared["date"].dt.year.astype(int)
     return prepared
 
 
