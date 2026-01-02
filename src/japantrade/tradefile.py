@@ -48,9 +48,21 @@ class NormalizationConfig:
     parallel_chunks: bool = False
     max_workers: Optional[int] = None
     output_formats: Tuple[str, ...] = ("csv", "parquet")
+    include_descriptions: bool = True
+    convert_to_base_units: bool = False
+    keep_units: Optional[Tuple[str, ...]] = None
+    exclude_units: Optional[Tuple[str, ...]] = None
+    warn_on_unknown: bool = True
+    lookup_paths: Optional[dict] = None
 
     def __post_init__(self):
         self.output_formats = tuple(fmt.lower() for fmt in self.output_formats)
+        if self.keep_units is not None:
+            self.keep_units = tuple(unit.upper() for unit in self.keep_units)
+        if self.exclude_units is not None:
+            self.exclude_units = tuple(unit.upper() for unit in self.exclude_units)
+        if self.lookup_paths is not None:
+            self.lookup_paths = {key.lower(): Path(value) for key, value in self.lookup_paths.items()}
 
 
 @dataclass
@@ -117,14 +129,22 @@ class NormalizationPipeline:
         def melt_units(df, context):
             return self.processor._meltUnits(df, context.kind)
 
+        def normalize_units(df, context):
+            return self.processor._normalize_units(df)
+
         def reduce_rows(df, context):
             return self.processor._reduce_rows(df), {}
+
+        def enrich(df, context):
+            return self.processor._enrich_with_lookups(df, context.kind)
 
         return [
             ("clean", clean),
             ("melt_months", melt_months),
             ("melt_units", melt_units),
+            ("normalize_units", normalize_units),
             ("reduce", reduce_rows),
+            ("enrich", enrich),
         ]
 
     def _compose_steps(self) -> List[Tuple[str, Callable]]:
@@ -275,6 +295,7 @@ the data.
         self.latest_timings = []
         self.kind = kind
         self._tqdm = self._load_tqdm() if self.normalization_config.use_tqdm else None
+        self._lookup_cache: dict = {}
 
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
@@ -924,6 +945,60 @@ No data were acquired.")
         )
         return melted, metrics
 
+    def _normalize_units(self, df: pd.DataFrame):
+        canonical_map = {
+            "KG": "KG",
+            "KGS": "KG",
+            "KILOGRAM": "KG",
+            "KILOGRAMS": "KG",
+            "NO": "NO",
+            "NUMBER": "NO",
+            "TH": "TH",
+            "THOUSAND": "TH",
+            "JPY": "JPY",
+        }
+        conversion_factors = {
+            "TH": ("NO", 1000),
+        }
+
+        normalized = df.copy()
+        normalized["unit"] = normalized["unit"].astype(str).str.upper()
+        normalized["unit"] = normalized["unit"].map(lambda u: canonical_map.get(u, u))
+
+        conversions = 0
+        if self.normalization_config.convert_to_base_units:
+            for source_unit, (target_unit, factor) in conversion_factors.items():
+                mask = normalized["unit"] == source_unit
+                if mask.any():
+                    normalized.loc[mask, "value"] = normalized.loc[mask, "value"] * factor
+                    normalized.loc[mask, "unit"] = target_unit
+                    conversions += int(mask.sum())
+
+        known_units = set(canonical_map.values())
+        unknown_units_mask = ~normalized["unit"].isin(known_units)
+        unknown_units = normalized.loc[unknown_units_mask, "unit"].unique().tolist()
+        if unknown_units and self.normalization_config.warn_on_unknown:
+            log.warning("Encountered unknown unit codes: %s", unknown_units)
+
+        filtered_out = 0
+        keep_units = set(self.normalization_config.keep_units or [])
+        exclude_units = set(self.normalization_config.exclude_units or [])
+        if keep_units:
+            keep_mask = normalized["unit"].isin(keep_units)
+            filtered_out += int((~keep_mask).sum())
+            normalized = normalized[keep_mask]
+        if exclude_units:
+            exclude_mask = normalized["unit"].isin(exclude_units)
+            filtered_out += int(exclude_mask.sum())
+            normalized = normalized[~exclude_mask]
+
+        metrics = {
+            "unit_conversions": conversions,
+            "filtered_rows": filtered_out,
+            "unknown_unit_count": int(unknown_units_mask.sum()),
+        }
+        return normalized, metrics
+
     def _reduce_rows(self, df):
         """
         Reduce the number of rows by deleting those that are zero.
@@ -940,6 +1015,98 @@ No data were acquired.")
         """
         reduced = df[df['value'] != 0].dropna()
         return reduced
+
+    def _lookup_path(self, key: str) -> Optional[Path]:
+        base_dir = Path(__file__).resolve().parent
+        overrides = self.normalization_config.lookup_paths or {}
+        if key in overrides:
+            candidate = overrides[key]
+            return candidate if candidate.exists() else None
+        default_map = {
+            "hs": base_dir / "HScodes.csv",
+            "pc": base_dir / "PCcodes.csv",
+            "country": base_dir / "Countries.csv",
+        }
+        candidate = default_map.get(key)
+        return candidate if candidate and candidate.exists() else None
+
+    def _load_lookup(self, key: str, loader: Callable[[Path], pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if key in self._lookup_cache:
+            return self._lookup_cache[key]
+        path = self._lookup_path(key)
+        if not path:
+            self._lookup_cache[key] = None
+            if self.normalization_config.warn_on_unknown:
+                log.warning("Lookup file for '%s' not found. Skipping enrichment.", key)
+            return None
+        loaded = loader(path)
+        self._lookup_cache[key] = loaded
+        return loaded
+
+    def _code_lookup(self, kind: str) -> Optional[pd.DataFrame]:
+        key = kind.lower()
+
+        def _loader(path: Path) -> pd.DataFrame:
+            df = pd.read_csv(path, delimiter=';', dtype=str)
+            df = df.rename(columns={"Code.1": "code", "Description": "code_description"})
+            if "code" not in df.columns or "code_description" not in df.columns:
+                return None
+            df["code"] = df["code"].astype(str).str.replace(r"\s+", "", regex=True)
+            df = df[["code", "code_description"]].dropna()
+            return df
+
+        return self._load_lookup(key, _loader)
+
+    def _country_lookup(self) -> Optional[pd.DataFrame]:
+        def _loader(path: Path) -> pd.DataFrame:
+            df = pd.read_csv(path, dtype=str)
+            rename_map = {col: col.strip().lower().replace(" ", "_") for col in df.columns}
+            df = df.rename(columns=rename_map)
+            if "code" not in df.columns:
+                return None
+            df["code"] = df["code"].astype(str).str.zfill(3)
+            name_col = "country" if "country" in df.columns else df.columns[-1]
+            zone_col = "geographical_zone" if "geographical_zone" in df.columns else None
+            keep_cols = ["code", name_col] + ([zone_col] if zone_col else [])
+            return df[keep_cols].rename(columns={name_col: "country_name", "code": "country"})
+
+        return self._load_lookup("country", _loader)
+
+    def _enrich_with_lookups(self, df: pd.DataFrame, kind: str):
+        if not self.normalization_config.include_descriptions:
+            return df, {}
+
+        enriched = df.copy()
+        metrics = {}
+
+        code_lookup = self._code_lookup(kind)
+        if code_lookup is not None and not code_lookup.empty:
+            before = len(enriched)
+            enriched = enriched.merge(code_lookup, how="left", on="code")
+            missing_codes = enriched["code_description"].isna().sum()
+            metrics["code_enriched"] = int(before - missing_codes)
+            metrics["missing_code_descriptions"] = int(missing_codes)
+        elif self.normalization_config.warn_on_unknown:
+            log.warning("Code lookup for kind '%s' unavailable; skipping code enrichment.", kind)
+
+        country_lookup = self._country_lookup()
+        if country_lookup is not None and not country_lookup.empty:
+            before = len(enriched)
+            enriched = enriched.merge(country_lookup, how="left", on="country")
+            missing_countries = enriched["country_name"].isna().sum()
+            metrics["country_enriched"] = int(before - missing_countries)
+            metrics["missing_country_descriptions"] = int(missing_countries)
+        elif self.normalization_config.warn_on_unknown:
+            log.warning("Country lookup unavailable; skipping country enrichment.")
+
+        if "code_description" in enriched:
+            unknown_codes = enriched[enriched["code_description"].isna()]["code"].unique().tolist()
+        else:
+            unknown_codes = []
+        if unknown_codes and self.normalization_config.warn_on_unknown:
+            log.warning("Unknown codes encountered during enrichment: %s", unknown_codes[:5])
+
+        return enriched, metrics
 
     def _acquireNewData(self, new_file=None, new_df=None, kind='infer', date_range=None):
         """
