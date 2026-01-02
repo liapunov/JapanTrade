@@ -14,7 +14,10 @@ This module contains a single class, TradeFile.
 # coding: utf-8
 import os
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Iterable, List, Optional, Tuple
 import pandas as pd
 import zipfile as zfile
 from time import time
@@ -34,6 +37,154 @@ formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
 console.setFormatter(formatter)
 logging.getLogger().addHandler(console)
 log = logging.getLogger("tradefile")
+
+
+@dataclass
+class NormalizationConfig:
+    """Configuration for the trade file normalization pipeline."""
+
+    chunk_size: int = 50000
+    use_tqdm: bool = False
+    parallel_chunks: bool = False
+    max_workers: Optional[int] = None
+    output_formats: Tuple[str, ...] = ("csv", "parquet")
+
+    def __post_init__(self):
+        self.output_formats = tuple(fmt.lower() for fmt in self.output_formats)
+
+
+@dataclass
+class NormalizationContext:
+    """Context passed to each normalization stage."""
+
+    kind: str
+    chunk_index: Optional[int] = None
+    metadata: dict = field(default_factory=dict)
+
+
+class NormalizationPipeline:
+    """Composable pipeline to normalize raw trade data chunks.
+
+    The pipeline wires together the canonical normalization steps (clean,
+    melt months, melt units, reduce rows) while allowing callers to inject
+    additional steps via :meth:`add_step`.
+    """
+
+    def __init__(self, processor: "TradeFile", config: NormalizationConfig, hooks: Optional[List[Tuple[str, Callable]]] = None):
+        self.processor = processor
+        self.config = config
+        self.logger = logging.getLogger("tradefile.pipeline")
+        self._custom_steps: List[dict] = []
+        self._tqdm = getattr(processor, "_tqdm", None)
+        if hooks:
+            for name, func in hooks:
+                self.add_step(name, func)
+
+    def add_step(self, name: str, func: Callable, position: Optional[int] = None,
+                 before: Optional[str] = None, after: Optional[str] = None):
+        """Register a custom step.
+
+        Parameters
+        ----------
+        name : str
+            Display name for the step.
+        func : Callable
+            Callable with signature ``func(df, context) -> (df, metrics_dict)``.
+        position : int, optional
+            Absolute index to insert the step in the pipeline order.
+        before : str, optional
+            Insert before the named step.
+        after : str, optional
+            Insert after the named step.
+        """
+        self._custom_steps.append({
+            "name": name,
+            "func": func,
+            "position": position,
+            "before": before,
+            "after": after
+        })
+
+    def _default_steps(self) -> List[Tuple[str, Callable]]:
+        def clean(df, context):
+            cleaned = self.processor._cleanDataFile(df)
+            self.processor._validate_raw_schema(cleaned.columns, context.kind)
+            return cleaned, {}
+
+        def melt_months(df, context):
+            return self.processor._meltMonths(df, context.kind)
+
+        def melt_units(df, context):
+            return self.processor._meltUnits(df, context.kind)
+
+        def reduce_rows(df, context):
+            return self.processor._reduce_rows(df), {}
+
+        return [
+            ("clean", clean),
+            ("melt_months", melt_months),
+            ("melt_units", melt_units),
+            ("reduce", reduce_rows),
+        ]
+
+    def _compose_steps(self) -> List[Tuple[str, Callable]]:
+        steps = list(self._default_steps())
+        for custom in self._custom_steps:
+            insertion = (custom["name"], custom["func"])
+            if custom.get("position") is not None:
+                steps.insert(custom["position"], insertion)
+                continue
+            if custom.get("before"):
+                try:
+                    idx = next(i for i, (name, _) in enumerate(steps) if name == custom["before"])
+                except StopIteration:
+                    idx = len(steps)
+                steps.insert(idx, insertion)
+                continue
+            if custom.get("after"):
+                try:
+                    idx = next(i for i, (name, _) in enumerate(steps) if name == custom["after"])
+                    steps.insert(idx + 1, insertion)
+                except StopIteration:
+                    steps.append(insertion)
+                continue
+            steps.append(insertion)
+        return steps
+
+    def _step_iterator(self, steps: List[Tuple[str, Callable]]):
+        if self._tqdm:
+            return self._tqdm(steps, desc="Normalizing chunk", unit="step")
+        return steps
+
+    def run(self, df: pd.DataFrame, kind: str, chunk_index: Optional[int] = None):
+        context = NormalizationContext(kind=kind, chunk_index=chunk_index)
+        composed_steps = self._compose_steps()
+        metrics: List[dict] = []
+        for name, func in self._step_iterator(composed_steps):
+            before_rows = len(df)
+            start = time()
+            result = func(df, context)
+            if isinstance(result, tuple) and len(result) == 2:
+                df, step_metrics = result
+            else:
+                df, step_metrics = result, {}
+            duration = time() - start
+            step_metrics = step_metrics or {}
+            step_metrics.update({
+                "duration": duration,
+                "before_rows": before_rows,
+                "after_rows": len(df)
+            })
+            metrics.append({"step": name, **step_metrics})
+            self.logger.info(
+                "Pipeline step '%s' completed for chunk %s | rows %s -> %s | %.2fs",
+                name,
+                chunk_index,
+                before_rows,
+                len(df),
+                duration
+            )
+        return df, metrics
 
 
 class TradeFile():
@@ -65,7 +216,10 @@ the data.
 
     def __init__(self, source=None, raw=True, direction='import',
                  kind='infer', base_file=None, base_df=None,
-                 chunk_size=50000, persist_path=None, persist_format=None):
+                 chunk_size=50000, persist_path=None, persist_format=None,
+                 normalization_config: Optional[NormalizationConfig] = None,
+                 use_tqdm: bool = False, parallel_chunks: bool = False,
+                 max_workers: Optional[int] = None, output_formats: Optional[Iterable[str]] = None):
         """
         Initialize a dataframe with a source trade file.
 
@@ -92,16 +246,35 @@ the data.
         persist_format : str
             optional format for persistence. Supported: 'parquet', 'feather'.
             Only used when persist_path is provided.
+        normalization_config : NormalizationConfig, optional
+            Pipeline settings. If omitted, one is created from other params.
+        use_tqdm : bool
+            Enable tqdm progress bars when available.
+        parallel_chunks : bool
+            Process normalization steps for chunks in parallel when safe.
+        max_workers : int, optional
+            Maximum workers for parallel chunk processing.
+        output_formats : Iterable[str], optional
+            Allowed output formats for saving normalized data.
         """
         if source is None:
             raise ValueError("You must specify the source file. Use raw=False\
                              if the file is already in normal form.")
 
-        self.chunk_size = chunk_size
+        base_config = normalization_config or NormalizationConfig(
+            chunk_size=chunk_size,
+            use_tqdm=use_tqdm,
+            parallel_chunks=parallel_chunks,
+            max_workers=max_workers,
+            output_formats=tuple(output_formats) if output_formats else ("csv", "parquet")
+        )
+        self.normalization_config = base_config
+        self.chunk_size = self.normalization_config.chunk_size
         self.persist_path = persist_path
         self.persist_format = persist_format
         self.latest_timings = []
         self.kind = kind
+        self._tqdm = self._load_tqdm() if self.normalization_config.use_tqdm else None
 
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
@@ -149,6 +322,14 @@ the data.
             inferred_kind = existing_kinds.pop()
         self.kind = inferred_kind
         return df
+
+    def _load_tqdm(self):
+        try:
+            from tqdm import tqdm  # type: ignore
+            return tqdm
+        except ImportError:
+            log.warning("tqdm requested but not installed. Proceeding without progress bars.")
+            return None
 
     def _primary_key(self):
         return self.PRIMARY_KEY
@@ -312,7 +493,7 @@ the data.
                 raise ValueError(f"_infer_kind: the 'kind' column is dirty.\n\
                                  Values in the column: {kinds}")
 
-    def _dfFromRaw(self, file, kind, chunk_size=50000):
+    def _dfFromRaw(self, file, kind, chunk_size=None):
         """
         Normalize raw trade data into a dataframe.
 
@@ -330,33 +511,56 @@ the data.
         """
         print(f"Opening {file}...")
         raw_stream = self._openRawData(file, chunk_size=chunk_size)
-        processed_chunks = []
-        inferred_kind = None
-        self.latest_timings = []
-        for idx, chunk in enumerate(raw_stream):
-            if inferred_kind is None:
-                inferred_kind = self._infer_kind(chunk)
-                self._validate_raw_schema(chunk.columns, inferred_kind)
-            else:
-                self._validate_raw_schema(chunk.columns, inferred_kind)
-
-            month_melted, month_timings = self._meltMonths(chunk, inferred_kind)
-            normalized, unit_timings = self._meltUnits(month_melted, inferred_kind)
-            reduced = self._reduce_rows(normalized)
-            reduced['kind'] = inferred_kind
-            self._persist_chunk(reduced, idx)
-            processed_chunks.append(reduced)
-            self.latest_timings.append({
-                'chunk_index': idx,
-                'melt_months': month_timings,
-                'melt_units': unit_timings
-            })
-
-        if not processed_chunks:
+        raw_iter = iter(raw_stream)
+        try:
+            first_chunk = next(raw_iter)
+        except StopIteration:
             raise ValueError("No data was loaded from the provided file.")
 
-        combined = pd.concat(processed_chunks, axis=0, ignore_index=True)
+        inferred_kind = kind if kind != 'infer' else self._infer_kind(first_chunk)
+
+        pipeline = NormalizationPipeline(self, self.normalization_config)
+        processed_chunks = []
+        self.latest_timings = []
+
+        def process(idx, chunk):
+            reduced, metrics = pipeline.run(chunk, inferred_kind, chunk_index=idx)
+            reduced['kind'] = inferred_kind
+            self._persist_chunk(reduced, idx)
+            return idx, reduced, metrics
+
+        # process first chunk synchronously to establish schema confidence
+        first_idx, first_reduced, first_metrics = process(0, first_chunk)
+        processed_chunks.append((first_idx, first_reduced))
+        self.latest_timings.append({'chunk_index': first_idx, 'metrics': first_metrics})
+        chunk_count = 1
+
+        if self.normalization_config.parallel_chunks:
+            futures = []
+            with ThreadPoolExecutor(max_workers=self.normalization_config.max_workers) as executor:
+                for idx, chunk in enumerate(raw_iter, start=1):
+                    futures.append(executor.submit(process, idx, chunk))
+                for future in as_completed(futures):
+                    idx, reduced, metrics = future.result()
+                    processed_chunks.append((idx, reduced))
+                    self.latest_timings.append({'chunk_index': idx, 'metrics': metrics})
+                    log.info("Completed chunk %s in parallel with %s rows", idx, len(reduced))
+                    chunk_count += 1
+        else:
+            chunk_iterator = enumerate(raw_iter, start=1)
+            if self._tqdm:
+                chunk_iterator = self._tqdm(chunk_iterator, desc="Processing chunks", unit="chunk")
+            for idx, chunk in chunk_iterator:
+                _, reduced, metrics = process(idx, chunk)
+                processed_chunks.append((idx, reduced))
+                self.latest_timings.append({'chunk_index': idx, 'metrics': metrics})
+                log.info("Completed chunk %s with %s rows", idx, len(reduced))
+                chunk_count += 1
+
+        processed_chunks = sorted(processed_chunks, key=lambda t: t[0])
+        combined = pd.concat([df for _, df in processed_chunks], axis=0, ignore_index=True)
         combined = self._deduplicate_by_key(combined)
+        log.info("Combined %s chunks into %s rows after deduplication", chunk_count, len(combined))
         return combined, inferred_kind
 
     def _opener(self):
@@ -474,7 +678,8 @@ the data.
         three letters
         (capitalized) of a specific month, e.g. "Jan", "Aug" etc.
         In case the file is a zip with multiple csv files, the function opens
-        and streams each file in chunks, yielding cleaned DataFrames one by one.
+        and streams each file in chunks. Cleaning and normalization are applied
+        later by the pipeline, so this generator yields raw chunks.
         If the file is a single csv, it is streamed in chunks as well.
 
         """
@@ -487,8 +692,7 @@ the data.
         chunksize = chunk_size or self.chunk_size
 
         for chunk in self._stream_raw_chunks(filename, trade_types, chunksize):
-            cleaned = self._cleanDataFile(chunk)
-            yield cleaned
+            yield chunk
 
     def _cleanDataFile(self, df):
         """Clean the dataframe acquired from the raw data."""
@@ -515,7 +719,7 @@ No data were acquired.")
         # data are either all import or all export
         log.debug(f"The columns before dropping the exp or imp column are \
 {df.columns}")
-        df = df.drop(columns=["Exp or Imp"])
+        df = df.drop(columns=["Exp or Imp"], errors="ignore")
         # remove the "'" from the code column
         if 'HS' in df.columns:
             df['HS'] = df['HS'].str.strip("' ")
@@ -832,6 +1036,12 @@ files were provided as merge parameters. The dataframe will be ignored.")
         Path
             The path where the file was saved.
         """
+        resolved_fmt = fmt.lower() if fmt else None
+        if resolved_fmt and resolved_fmt not in self.normalization_config.output_formats:
+            raise ValueError(
+                f"Format '{fmt}' is not allowed. "
+                f"Supported formats: {self.normalization_config.output_formats}"
+            )
         target_path, resolved_fmt, resolved_compression = self._build_output_path(path, filename, fmt, compression)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
