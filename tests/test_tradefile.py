@@ -10,7 +10,21 @@ def _build_tradefile():
     tradefile.persist_format = None
     tradefile.chunk_size = 50000
     tradefile.latest_timings = []
+    tradefile.kind = 'HS'
     return tradefile
+
+
+def _sample_normalized_df(kind='HS'):
+    return pd.DataFrame(
+        {
+            'kind': [kind, kind],
+            'country': ['001', '001'],
+            'code': ['0101', '0101'],
+            'date': ['2021-01-01', '2021-02-01'],
+            'unit': ['KG', 'KG'],
+            'value': [100, 200],
+        }
+    )
 
 
 def test_melt_months_and_units_hs_branch():
@@ -101,3 +115,60 @@ def test_melt_units_mixed_value_rows_raise():
     melted_months, _ = tf._meltMonths(pc_df, 'PC')
     with pytest.raises(ValueError):
         tf._meltUnits(melted_months, 'PC')
+
+
+def test_acquire_new_data_deduplicates_and_enforces_kind():
+    tf = _build_tradefile()
+    tf.data = _sample_normalized_df(kind='HS')
+    tf.data = tf._ensure_kind_column(tf.data, 'HS')
+
+    new_df = pd.DataFrame(
+        {
+            'kind': ['HS', 'HS'],
+            'country': ['001', '001'],
+            'code': ['0101', '0101'],
+            'date': ['2021-02-01', '2021-03-01'],
+            'unit': ['KG', 'KG'],
+            'value': [300, 400],
+        }
+    )
+
+    merged = tf._acquireNewData(new_df=new_df, kind='HS')
+    assert len(merged) == 3
+    assert merged[merged['date'] == '2021-02-01']['value'].iloc[0] == 200
+    with pytest.raises(ValueError):
+        tf._acquireNewData(
+            new_df=new_df.assign(kind='PC'),
+            kind='PC'
+        )
+
+
+def test_acquire_new_data_incremental_date_window(tmp_path):
+    tf = _build_tradefile()
+    tf.data = _sample_normalized_df(kind='HS')
+    tf.data = tf._ensure_kind_column(tf.data, 'HS')
+
+    new_df = pd.DataFrame(
+        {
+            'kind': ['HS', 'HS'],
+            'country': ['001', '001'],
+            'code': ['0101', '0101'],
+            'date': ['2021-01-01', '2021-02-01'],
+            'unit': ['KG', 'KG'],
+            'value': [150, 250],
+        }
+    )
+
+    merged = tf._acquireNewData(new_df=new_df, kind='HS', date_range=('2021-01-01', '2021-02-01'))
+    assert len(merged) == 2
+    assert set(merged['value']) == {150, 250}
+
+
+def test_save_to_file_with_custom_filename_and_parquet(tmp_path):
+    tf = _build_tradefile()
+    tf.data = _sample_normalized_df(kind='HS')
+    tf.data = tf._ensure_kind_column(tf.data, 'HS')
+    target = tf.save_to_file(path=tmp_path, filename="custom_output", fmt="parquet")
+    assert target.exists()
+    saved = pd.read_parquet(target)
+    assert len(saved) == len(tf.data)

@@ -14,6 +14,7 @@ This module contains a single class, TradeFile.
 # coding: utf-8
 import os
 import logging
+from pathlib import Path
 import pandas as pd
 import zipfile as zfile
 from time import time
@@ -36,6 +37,7 @@ log = logging.getLogger("tradefile")
 
 
 class TradeFile():
+    PRIMARY_KEY = ['kind', 'country', 'code', 'date', 'unit']
     """
     Trade data processing tool for the Japanese Customs database.
 
@@ -99,20 +101,179 @@ the data.
         self.persist_path = persist_path
         self.persist_format = persist_format
         self.latest_timings = []
+        self.kind = kind
 
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
+            self.data = self._ensure_kind_column(self.data, self.kind)
             self.data = self._acquireNewData(new_file=source, kind=kind)
         elif base_df is not None:
-            self.data, self.kind = base_df, kind
+            self.data, self.kind = self._ensure_kind_column(base_df, kind), kind
             self.data = self._acquireNewData(new_file=source, kind=kind)
         elif raw:
             log.warning("Warning: this operation might take more than one \
  minute if the file spans over more years.")
             self.data, self.kind = self._dfFromRaw(
                 source, kind, chunk_size=self.chunk_size)
+            self.data = self._ensure_kind_column(self.data, self.kind)
         else:
             self.data, self.kind = self._openNormalFile(source, kind)
+            self.data = self._ensure_kind_column(self.data, self.kind)
+
+    def _ensure_kind_column(self, df, kind):
+        """Ensure the dataframe contains a consistent 'kind' column."""
+        inferred_kind = kind
+        if 'kind' not in df.columns:
+            if kind == 'infer':
+                raise ValueError(
+                    "Cannot infer kind without a 'kind' column. "
+                    "Please specify kind='HS' or kind='PC'."
+                )
+            inferred_kind = kind
+            df = df.copy()
+            df['kind'] = inferred_kind
+        else:
+            if kind == 'infer':
+                inferred_kind = self._infer_kind(df, raw=False)
+            existing_kinds = set(df['kind'].astype(str).unique())
+            if len(existing_kinds) > 1:
+                raise ValueError(
+                    "Multiple kinds detected in provided dataframe: "
+                    f"{existing_kinds}"
+                )
+            if inferred_kind != 'infer' and inferred_kind not in existing_kinds:
+                raise ValueError(
+                    f"Inconsistent kind detected. Expected {inferred_kind}, "
+                    f"found {existing_kinds}"
+                )
+            inferred_kind = existing_kinds.pop()
+        self.kind = inferred_kind
+        return df
+
+    def _primary_key(self):
+        return self.PRIMARY_KEY
+
+    def _deduplicate_by_key(self, df):
+        missing_key_cols = [col for col in self._primary_key() if col not in df.columns]
+        if missing_key_cols:
+            raise ValueError(
+                f"Cannot deduplicate dataframe. Missing primary key columns: {missing_key_cols}"
+            )
+        before = len(df)
+        deduped = df.drop_duplicates(subset=self._primary_key())
+        after = len(deduped)
+        if after != before:
+            log.info(
+                "Deduplicated dataframe on primary key.",
+                extra={"deduplication": {"before": before, "after": after}}
+            )
+        return deduped
+
+    def _snapshot_state(self, df):
+        key_columns = [col for col in self._primary_key() if col in df.columns]
+        ordered = df
+        if key_columns:
+            ordered = df.sort_values(by=key_columns)
+        ordered = ordered.reset_index(drop=True)
+        checksum = pd.util.hash_pandas_object(
+            ordered.fillna(""), index=False
+        ).sum()
+        return {"rows": len(df), "checksum": int(checksum)}
+
+    def _log_validation(self, stage, before_snapshot, after_snapshot, extra=None):
+        payload = {
+            "stage": stage,
+            "before": before_snapshot,
+            "after": after_snapshot
+        }
+        if extra:
+            payload["meta"] = extra
+        log.info("Data validation", extra={"validation": payload})
+
+    def _normalize_compression(self, compression):
+        if compression in (None, 'zip', 'gzip', 'bz2'):
+            return compression
+        if compression in ('gz',):
+            return 'gzip'
+        if compression in ('bz',):
+            return 'bz2'
+        raise ValueError("Unsupported compression. Use 'zip', 'gzip', or 'bz2'.")
+
+    def _compression_from_suffix(self, suffix):
+        mapping = {
+            '.gz': 'gzip',
+            '.gzip': 'gzip',
+            '.zip': 'zip',
+            '.bz2': 'bz2'
+        }
+        return mapping.get(suffix)
+
+    def _extension_for(self, fmt, compression):
+        fmt = fmt.lower()
+        normalized_compression = self._normalize_compression(compression)
+        compression_extension = {
+            'zip': 'zip',
+            'gzip': 'gz',
+            'bz2': 'bz2',
+            None: None
+        }
+        if fmt == 'csv':
+            if normalized_compression in ('zip', 'gzip', 'bz2'):
+                return f".csv.{compression_extension[normalized_compression]}"
+            return ".csv"
+        if fmt == 'parquet':
+            return ".parquet"
+        raise ValueError("Unsupported format. Use 'csv' or 'parquet'.")
+
+    def _default_filename(self, fmt, compression):
+        ordered_timerange = self.data['date'].sort_values()
+        first_date = ordered_timerange.iloc[0]
+        last_date = ordered_timerange.iloc[-1]
+        extension = self._extension_for(fmt, compression)
+        return f"{self.kind}_{first_date}_{last_date}{extension}"
+
+    def _build_output_path(self, path, filename, fmt, compression):
+        base_path = Path(path)
+        if base_path.suffix and filename is None:
+            target_dir = base_path.parent
+            filename = base_path.name
+        elif base_path.suffix:
+            target_dir = base_path.parent
+        else:
+            target_dir = base_path
+
+        resolved_fmt = fmt.lower() if fmt else None
+        resolved_compression = self._normalize_compression(compression)
+        if filename:
+            target_path = target_dir / filename
+            suffixes = target_path.suffixes
+            if suffixes:
+                detected_compression = self._compression_from_suffix(suffixes[-1])
+                if detected_compression:
+                    resolved_compression = resolved_compression or detected_compression
+                    if len(suffixes) > 1:
+                        resolved_fmt = resolved_fmt or suffixes[-2].lstrip('.')
+                else:
+                    resolved_fmt = resolved_fmt or suffixes[-1].lstrip('.')
+            else:
+                resolved_fmt = resolved_fmt or 'csv'
+                target_path = target_path.with_suffix(self._extension_for(resolved_fmt, resolved_compression))
+        else:
+            resolved_fmt = resolved_fmt or 'csv'
+            target_path = target_dir / self._default_filename(resolved_fmt, resolved_compression)
+
+        if not target_path.suffix:
+            resolved_fmt = resolved_fmt or 'csv'
+            target_path = target_path.with_suffix(self._extension_for(resolved_fmt, resolved_compression))
+
+        return target_path, resolved_fmt, resolved_compression
+
+    def _load_saved_file(self, target_path, fmt, compression):
+        if fmt == 'parquet':
+            return pd.read_parquet(target_path)
+        if fmt == 'csv':
+            return pd.read_csv(target_path, compression=compression)
+        raise ValueError("Unsupported format for loading. Use 'csv' or 'parquet'.")
 
 
     def _infer_kind(self, df, raw=True):
@@ -195,6 +356,7 @@ the data.
             raise ValueError("No data was loaded from the provided file.")
 
         combined = pd.concat(processed_chunks, axis=0, ignore_index=True)
+        combined = self._deduplicate_by_key(combined)
         return combined, inferred_kind
 
     def _opener(self):
@@ -581,7 +743,7 @@ monthly columns!")
         reduced = df[df['value'] != 0].dropna()
         return reduced
 
-    def _acquireNewData(self, new_file=None, new_df=None, kind='infer'):
+    def _acquireNewData(self, new_file=None, new_df=None, kind='infer', date_range=None):
         """
         Add extra data from file (csv, zip) to the normalized trade dataframe.
 
@@ -593,12 +755,20 @@ monthly columns!")
         new_df : pd.DataFrame
             an existing in-memory dataframe with new, raw data
 
+        date_range : tuple, optional
+            (start_date, end_date) inclusive window to merge incrementally.
+            Rows in the existing dataframe within the window are replaced.
+
         Returns
         -------
         pd.DataFrame
             a dataframe with the new data merged with the existing data.
 
         """
+        if date_range is not None and (not isinstance(date_range, (list, tuple)) or len(date_range) != 2):
+            raise ValueError("date_range must be a tuple or list of two date strings (start, end).")
+
+        base_snapshot = self._snapshot_state(self.data)
         if new_file is not None:
             # we are giving priority to files.
             # if both a DF and a file are specified,
@@ -610,57 +780,88 @@ files were provided as merge parameters. The dataframe will be ignored.")
             # normalize the new file
             new_data, kind = self._dfFromRaw(
                 new_file, kind, chunk_size=self.chunk_size)
-            # merge to the existing dataframe
-            updated_df = pd.concat([self.data, new_data], ignore_index=True)\
-                .drop_duplicates()
+            new_data = self._ensure_kind_column(new_data, kind)
         elif new_df is not None:
-            # merge to the existing file
-            updated_df = pd.concat([self.data, new_df], ignore_index=True)\
-                .drop_duplicates()
+            new_data = self._ensure_kind_column(new_df, kind)
         else:
             # no file or DataFrame to merge with
             return self.data
-        return updated_df
+        if self.kind not in ['infer', None] and self.kind != self._infer_kind(new_data, raw=False):
+            raise ValueError(
+                f"Inconsistent kind when merging. Existing kind: {self.kind}, "
+                f"new data kind: {self._infer_kind(new_data, raw=False)}"
+            )
+        self.kind = self._infer_kind(new_data, raw=False)
 
-    def save_to_file(self, path="./data/", is_zip=False):
+        if date_range:
+            start_date, end_date = date_range
+            new_data = new_data[new_data['date'].between(start_date, end_date)]
+            base_subset = self.data[~self.data['date'].between(start_date, end_date)]
+        else:
+            base_subset = self.data
+
+        combined = pd.concat([base_subset, new_data], ignore_index=True)
+        combined = self._deduplicate_by_key(combined)
+        after_snapshot = self._snapshot_state(combined)
+        self._log_validation(
+            "merge",
+            before_snapshot=base_snapshot,
+            after_snapshot=after_snapshot,
+            extra={"date_range": date_range}
+        )
+        self.data = combined
+        return combined
+
+    def save_to_file(self, path="./data/", filename=None, fmt="csv", compression=None):
         """
-        Save TradeFile.data onto file.
+        Save TradeFile.data to disk with validation.
 
         Parameters
         ----------
-        is_zip : TYPE, optional
-            whether to compress or not. The default is False.
+        path : str
+            Directory or file path.
+        filename : str, optional
+            Optional file name (with or without extension).
+        fmt : str, optional
+            'csv' or 'parquet'. Defaults to 'csv'.
+        compression : str, optional
+            Compression codec. For CSV: 'zip', 'gzip', 'bz2'. For Parquet: codec string accepted by pandas.
 
         Returns
         -------
-        None.
-
+        Path
+            The path where the file was saved.
         """
-        ordered_timerange = self.data['date'].sort_values()
-        first_date = ordered_timerange.iloc[0]
-        last_date = ordered_timerange.iloc[-1]
-        kind = self.kind
-        # create the complete path. Find a name if not provided.
-        if path[-4:] == '.csv':
-            is_zip = False
-            complete_path = path
-            path = complete_path.rpartition()('/')[1]
-        elif path[-4:] == '.zip':
-            is_zip = True
-            complete_path = path
-            path = complete_path.rpartition()('/')[1]
-        else:
-            filename = '_'.join([kind, first_date, last_date])
-            extension = '.zip' if is_zip else '.csv'
-            # works even for mistakes in the file name
-            # e.g. if the path in input is "/data/2020.xls"
-            # (i.e. not a csv or zip extension)
-            # it becomes "/data/2020.xls/newfilename.csv".
-            if path[-1] != '/':
-                path += '/'
-            complete_path = "".join([path, filename, extension])
+        target_path, resolved_fmt, resolved_compression = self._build_output_path(path, filename, fmt, compression)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not os.path.exists(path):
-            os.mkdir(path)
-        self.data.to_csv(complete_path, index=False)
-        log.info(f"TradeFile.save_to_file: saved data to {complete_path}.")
+        before_snapshot = self._snapshot_state(self.data)
+        if resolved_fmt == 'parquet':
+            self.data.to_parquet(
+                target_path,
+                index=False,
+                compression=resolved_compression
+            )
+        elif resolved_fmt == 'csv':
+            self.data.to_csv(
+                target_path,
+                index=False,
+                compression=resolved_compression
+            )
+        else:
+            raise ValueError("Unsupported format. Use 'csv' or 'parquet'.")
+
+        saved_df = self._load_saved_file(target_path, resolved_fmt, resolved_compression)
+        after_snapshot = self._snapshot_state(saved_df)
+        self._log_validation(
+            "save",
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+            extra={
+                "path": str(target_path),
+                "format": resolved_fmt,
+                "compression": resolved_compression
+            }
+        )
+        log.info(f"TradeFile.save_to_file: saved data to {target_path}.")
+        return target_path
