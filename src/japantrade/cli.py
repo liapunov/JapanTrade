@@ -1,112 +1,102 @@
+"""Command line interface for the reproducible JapanTrade workflow."""
 from __future__ import annotations
 
 import argparse
-import sys
+import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-import pandas as pd
-
-from .analytics import (
-    apply_parameterized_filters,
-    load_normalized_data,
-    month_over_month_trends,
-    trailing_12_month_totals,
-    year_over_year_trends,
-)
+from .analytics import country_product_ranking, load_normalized_data, product_country_comparison, search_hs
+from .customsgrabber import CustomsGrabber
+from .tradefile import TradeFile
 
 
-def _parse_date_range(start: Optional[str], end: Optional[str]) -> Optional[tuple[pd.Timestamp, pd.Timestamp]]:
-    if not start and not end:
+def _years(value: str) -> tuple[int, int]:
+    try:
+        start, end = (int(part) for part in value.split(":", 1))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("years must be START:END, for example 2024:2025") from exc
+    return start, end
+
+
+def _period(args) -> Optional[tuple[str, str]]:
+    if not args.date_start and not args.date_end:
         return None
-    start_ts = pd.to_datetime(start) if start else pd.Timestamp.min
-    end_ts = pd.to_datetime(end) if end else pd.Timestamp.max
-    if start_ts > end_ts:
-        raise ValueError("Start date must be before end date.")
-    return start_ts, end_ts
+    if not (args.date_start and args.date_end):
+        raise ValueError("Specify both --date-start and --date-end.")
+    return args.date_start, args.date_end
+
+
+def _write_or_print(data, output: Optional[Path]) -> None:
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        data.to_csv(output, index=False)
+        print(f"Wrote {len(data)} rows to {output}")
+    else:
+        print(data.to_string(index=False))
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Filter normalized Japan trade data and compute aggregates.")
-    parser.add_argument("source", help="Path to a normalized CSV file.")
-    parser.add_argument("--kind", help="Restrict to a code kind (HS/PC).")
-    parser.add_argument("--countries", nargs="+", help="Exact country codes to include.")
-    parser.add_argument("--country-prefixes", nargs="+", help="Country code prefixes (e.g. 00).")
-    parser.add_argument("--codes", nargs="+", help="Exact HS/PC codes to include.")
-    parser.add_argument("--code-prefixes", nargs="+", help="HS/PC code prefixes to include.")
-    parser.add_argument("--units", nargs="+", help="Measurement units to include.")
-    parser.add_argument("--date-start", help="Inclusive start date (YYYY-MM-DD).")
-    parser.add_argument("--date-end", help="Inclusive end date (YYYY-MM-DD).")
-    parser.add_argument(
-        "--aggregate",
-        choices=["yoy", "mom", "trailing12"],
-        help="Optional aggregate to compute after filtering.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="If provided, write the filtered rows to this CSV path.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=10,
-        help="Number of rows to display from the filtered/aggregated result.",
-    )
+    parser = argparse.ArgumentParser(prog="japantrade", description="Japanese Customs HS trade data tools")
+    commands = parser.add_subparsers(dest="command", required=True)
+    download = commands.add_parser("download", help="Download official HS archives")
+    download.add_argument("--direction", required=True, choices=("import", "export"))
+    download.add_argument("--years", required=True, type=_years)
+    download.add_argument("--output", type=Path, required=True)
+    prepare = commands.add_parser("prepare", help="Normalize one downloaded CSV/ZIP into a dataset")
+    prepare.add_argument("source", type=Path)
+    prepare.add_argument("--direction", required=True, choices=("import", "export"))
+    prepare.add_argument("--output", type=Path, required=True)
+    prepare.add_argument("--no-descriptions", action="store_true")
+    hs = commands.add_parser("hs", help="Discover HS codes")
+    hs_sub = hs.add_subparsers(dest="hs_command", required=True)
+    hs_search = hs_sub.add_parser("search", help="Search HS descriptions")
+    hs_search.add_argument("query")
+    hs_search.add_argument("--level", type=int)
+    hs_search.add_argument("--limit", type=int, default=20)
+    rank = commands.add_parser("country-rank", help="Rank HS categories for one country")
+    rank.add_argument("source", type=Path)
+    rank.add_argument("--country", required=True)
+    rank.add_argument("--direction", required=True, choices=("import", "export"))
+    rank.add_argument("--hs-level", type=int, default=4)
+    rank.add_argument("--limit", type=int, default=20)
+    rank.add_argument("--date-start")
+    rank.add_argument("--date-end")
+    rank.add_argument("--output", type=Path)
+    compare = commands.add_parser("compare", help="Compare selected HS products across countries")
+    compare.add_argument("source", type=Path)
+    compare.add_argument("--countries", nargs="+", required=True)
+    compare.add_argument("--codes", nargs="+", required=True)
+    compare.add_argument("--direction", required=True, choices=("import", "export"))
+    compare.add_argument("--date-start")
+    compare.add_argument("--date-end")
+    compare.add_argument("--output", type=Path)
     return parser
 
 
-def _run_aggregate(name: str, df: pd.DataFrame) -> pd.DataFrame:
-    if name == "yoy":
-        return year_over_year_trends(df)
-    if name == "mom":
-        return month_over_month_trends(df)
-    if name == "trailing12":
-        return trailing_12_month_totals(df)
-    raise ValueError(f"Unknown aggregate {name}")
-
-
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    parser = build_argument_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
-
-    try:
-        date_range = _parse_date_range(args.date_start, args.date_end)
-    except ValueError as exc:
-        parser.error(str(exc))
-    df = load_normalized_data(args.source)
-    filtered = apply_parameterized_filters(
-        df,
-        kind=args.kind,
-        countries=args.countries,
-        country_prefixes=args.country_prefixes,
-        codes=args.codes,
-        code_prefixes=args.code_prefixes,
-        units=args.units,
-        date_range=date_range,
-    )
-
-    print(f"Rows after filtering: {len(filtered)}")
-    if not filtered.empty:
-        min_date = pd.to_datetime(filtered['date']).min().date()
-        max_date = pd.to_datetime(filtered['date']).max().date()
-        print(f"Date span: {min_date} to {max_date}")
-        print(filtered.head(args.limit).to_string(index=False))
-
-    if args.aggregate:
-        try:
-            aggregated = _run_aggregate(args.aggregate, filtered)
-        except ValueError as exc:  # pragma: no cover - exercised in tests via CLI call
-            print(f"Aggregation failed: {exc}", file=sys.stderr)
-            return 1
-        print(f"\nAggregate '{args.aggregate}' (first {args.limit} rows):")
-        print(aggregated.head(args.limit).to_string(index=False))
-
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        filtered.to_csv(args.output, index=False)
-        print(f"Wrote filtered data to {args.output}")
-
+    args = build_argument_parser().parse_args(list(argv) if argv is not None else None)
+    if args.command == "download":
+        start, end = args.years
+        args.output.mkdir(parents=True, exist_ok=True)
+        paths = CustomsGrabber().grabRange(start, end, direction=args.direction, kind="HS", save_folder=str(args.output), allow_large_download=True)
+        (args.output / "manifest.json").write_text(json.dumps({"direction": args.direction, "years": [start, end], "files": paths}, indent=2), encoding="utf-8")
+        return 0
+    if args.command == "prepare":
+        from .tradefile import NormalizationConfig
+        trade = TradeFile(args.source, direction=args.direction, kind="HS", normalization_config=NormalizationConfig(include_descriptions=not args.no_descriptions))
+        target = trade.save_to_file(args.output, fmt="parquet")
+        print(f"Prepared {len(trade.data)} rows at {target}")
+        return 0
+    if args.command == "hs":
+        _write_or_print(search_hs(args.query, args.level, args.limit), None)
+        return 0
+    data = load_normalized_data(args.source)
+    period = _period(args)
+    if args.command == "country-rank":
+        _write_or_print(country_product_ranking(data, args.country, args.direction, period, args.hs_level, args.limit), args.output)
+    elif args.command == "compare":
+        _write_or_print(product_country_comparison(data, args.countries, args.codes, args.direction, period), args.output)
     return 0
 
 

@@ -1,6 +1,53 @@
 [build-system]
 requires = [
-    "setuptools>=42",
+    "setuptools>=61",
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "japantrade"
+version = "0.1.0"
+description = "Download, prepare, and analyze Japanese Customs HS trade data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Francesco Rinarelli"}]
+dependencies = [
+    "beautifulsoup4",
+    "pandas>=1.5",
+    "requests",
+]
+classifiers = ["Programming Language :: Python :: 3"]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=10"]
+duckdb = ["duckdb"]
+app = ["streamlit", "altair", "plotly"]
+dev = [
+    "pytest>=8.4.2",
+    "pyarrow>=10",
+    "duckdb",
+    "mcp",
+    "nbformat>=5.10.4",
+]
+mcp = [
+    "mcp>=1.28.1",
+]
+
+[project.scripts]
+japantrade = "japantrade.cli:main"
+japantrade-mcp = "japantrade.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/liapunov/JapanTrade"
+Source = "https://github.com/liapunov/JapanTrade"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+japantrade = ["*.csv"]

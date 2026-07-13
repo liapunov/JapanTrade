@@ -57,27 +57,20 @@ def test_trailing_totals_guard_against_sparse_units():
         trailing_12_month_totals(df)
 
 
-def test_cli_filters_and_mom(tmp_path):
-    source = Path(__file__).parent / "fixtures" / "normalized_sample.csv"
-    output = tmp_path / "filtered.csv"
+def test_cli_hs_search():
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "japantrade.cli",
-            str(source),
-            "--countries",
-            "001",
-            "--aggregate",
-            "mom",
-            "--codes",
-            "0101",
-            "--output",
-            str(output),
+            "hs",
+            "search",
+            "live animals",
+            "--limit",
+            "1",
         ],
         capture_output=True,
         text=True,
     )
     assert result.returncode == 0
-    assert "Rows after filtering" in result.stdout
-    assert output.exists()
+    assert "code" in result.stdout
