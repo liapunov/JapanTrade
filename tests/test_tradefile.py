@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 import pytest
 
-from japantrade.tradefile import NormalizationConfig, TradeFile
+from japantrade.tradefile import MONTH_DICT, NormalizationConfig, TradeFile
 
 
 def _build_tradefile(config: NormalizationConfig | None = None):
@@ -176,6 +176,41 @@ def test_save_to_file_with_custom_filename_and_parquet(tmp_path):
     assert target.exists()
     saved = pd.read_parquet(target)
     assert len(saved) == len(tf.data)
+
+
+def test_tradefile_accepts_path_sources(tmp_path):
+    source = tmp_path / "normalized.csv"
+    _sample_normalized_df().assign(direction="export").to_csv(source, index=False)
+
+    loaded = TradeFile(source, raw=False, kind="HS", direction="export")
+
+    assert len(loaded.data) == 2
+    assert set(loaded.data["direction"]) == {"export"}
+
+
+def test_tradefile_rejects_mismatched_normalized_direction(tmp_path):
+    source = tmp_path / "normalized.csv"
+    _sample_normalized_df().assign(direction="export").to_csv(source, index=False)
+
+    with pytest.raises(ValueError, match="Direction mismatch"):
+        TradeFile(source, raw=False, kind="HS", direction="import")
+
+
+def test_raw_file_normalization_uses_string_units_not_categoricals(tmp_path):
+    raw = {
+        "Year": ["2024"], "HS": ["0101"], "Country": ["220"],
+        "Unit1": ["KG"], "Unit2": ["NO"],
+    }
+    for month in MONTH_DICT:
+        raw[f"Quantity1-{month}"] = [1]
+        raw[f"Quantity2-{month}"] = [2]
+        raw[f"Value-{month}"] = [3]
+    source = tmp_path / "raw.csv"
+    pd.DataFrame(raw).to_csv(source, index=False)
+
+    normalized = TradeFile(source, direction="export", kind="HS")
+
+    assert {"KG", "NO", "JPY"}.issubset(set(normalized.data["unit"]))
 
 
 def test_normalize_units_conversion_and_filtering(caplog):

@@ -1,166 +1,98 @@
 # JapanTrade
 
-Tools for acquiring, cleaning, analyzing, and interactively exploring Japanese customs trade data when no official API is available. The library focuses on:
+JapanTrade downloads, prepares, and analyzes Japanese Customs HS import and export data. It supports two analyst workflows: ranking product categories for one trading partner and comparing selected HS categories across countries.
 
-* Downloading monthly CSV releases from the customs repository.
-* Normalizing wide monthly tables into long, analysis-ready data.
-* Producing quick exploratory reports, notebook examples, and a Streamlit dashboard for exploratory analysis.
+The data comes from the Japanese government e-Stat/Japan Customs releases. JapanTrade is not an official government service. Record release periods and source metadata when publishing results.
 
-> Note: The repository ships Python tools, research notebooks, and a Streamlit app for interactive exploration. A CLI is still on the roadmap.
+## Install
 
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `src/japantrade/customsgrabber.py` | Download helper for monthly customs CSV archives (import/export, HS/PC classification). |
-| `src/japantrade/tradefile.py` | Normalizes raw CSV/ZIP exports into a tidy pandas DataFrame. |
-| `src/japantrade/tradeanalysis.py` | Lightweight reporting utilities on top of normalized data. |
-| `src/japantrade/Trade Tools.ipynb` | End-to-end examples: download → normalize → basic visuals. |
-| `src/japantrade/Trade data analysis.ipynb` | Exploratory analysis on normalized datasets. |
-| `src/japantrade/app.py` | Streamlit "Japan Trade Explorer" dashboard backed by normalized data. |
-| `Japanese_HS_Codes.ipynb` | HS code description extraction from static tables. |
-
-## Setup
+Python 3.10+ is required. Use Parquet for prepared datasets.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install "japantrade[parquet]"
 ```
 
-Pandas and BeautifulSoup are required for the core workflow. Jupyter is recommended for running the bundled notebooks.
+For repository development, create a development environment:
 
-## Data acquisition: `CustomsGrabber`
-
-Located in `src/japantrade/customsgrabber.py`, `CustomsGrabber` automates downloads from the customs portal.
-
-### Key parameters
-
-* `direction`: `"import"` or `"export"`.
-* `kind`: `"HS"` (Harmonized System) or `"PC"` (Japanese product classification).
-* `from_year`, `to_year`: inclusive year bounds (≥1988, current year capped).
-* `save_folder`: where ZIP files are written (defaults to `../data/` relative to the module).
-
-### Usage examples
-
-```python
-from japantrade.customsgrabber import CustomsGrabber
-
-grabber = CustomsGrabber()
-# Download a single year of HS import data
-grabber.grabRange(from_year=2022, to_year=2022, direction="import", kind="HS", save_folder="./data/")
-
-# Fetch the latest available year
-grabber.getLastData(direction="export", kind="PC", save_folder="./data/")
+```bash
+uv sync --extra dev
+uv run pytest -q
 ```
 
-The downloader batches requests in chunks of up to 100 files to keep URLs below server limits. It saves ZIP archives you can pass directly to `TradeFile`.
+## Quick start
 
-## Data normalization: `TradeFile`
+Discover HS categories without downloading any data:
 
-`TradeFile` (in `src/japantrade/tradefile.py`) converts raw customs CSVs or ZIP bundles into long-form pandas DataFrames.
+```bash
+japantrade hs search "electric vehicle" --level 4
+japantrade hs search 8703 --limit 10
+```
 
-### What it does
+Download and prepare one direction at a time. e-Stat can be slow; begin with one year and use a longer timeout through `CustomsGrabber` if the CLI download times out.
 
-1. **Cleaning** – fixes known column typos (e.g., `Apl` → `Apr`), strips code artifacts, drops yearly totals.
-2. **Month unpivot** – melts `Quantity1/Quantity2/Value` columns across months into a `date/type/measure` layout.
-3. **Unit unpivot + normalization** – consolidates units into a single column, canonizes codes (e.g., `KGS` → `KG`), optionally converts base units (e.g., thousands → absolute counts), and supports keep/exclude lists with warnings on unknowns.
-4. **Enrichment** – reuses cached HS/PC and country lookup files (configurable overrides) to attach descriptions during batch processing.
-5. **Row reduction** – removes zero or missing values for a compact, analysis-ready table.
+```bash
+japantrade download --direction export --years 2025:2025 --output raw/exports
+japantrade prepare raw/exports/export_HS_2025-2025.zip --direction export --output data/exports_2025.parquet
+```
 
-### Creating a normalized DataFrame
+For multiple yearly ZIPs, normalize and merge them with the current package API. The notebook [Trade Tools](src/japantrade/Trade%20Tools.ipynb) contains a copyable example.
+
+Run analyses against an explicit prepared dataset:
+
+```bash
+japantrade country-rank data/japan_exports_2023_2025.parquet \
+  --country Italy --direction export --hs-level 4 --limit 20 \
+  --output results/italy_exports_hs4.csv
+
+japantrade compare data/japan_exports_2023_2025.parquet \
+  --countries Italy Germany USA --codes 8703 --direction export \
+  --output results/hs8703_comparison.csv
+```
+
+`--output` writes CSV and creates the parent directory when needed.
+
+## Analyst API
 
 ```python
-from japantrade.tradefile import TradeFile
-
-normalized = TradeFile(
-    source="./data/import_HS_2022.zip",  # raw CSV or ZIP
-    raw=True,                            # set to False if already normalized
-    kind="infer"                         # infer HS vs PC from columns
+from japantrade import (
+    country_product_ranking,
+    load_normalized_data,
+    product_country_comparison,
+    search_hs,
 )
-df = normalized.data  # columns: kind, country, code, date, unit, value
-```
 
-### Merging additional files
+data = load_normalized_data("data/japan_exports_2023_2025.parquet")
+matches = search_hs("machine tool", level=4)
 
-`TradeFile` accepts an existing normalized CSV/ZIP (`base_file`) or DataFrame (`base_df`) and will append deduplicated new rows:
-
-```python
-base = "./data/normalized_2019_2021.csv"
-merged = TradeFile(source="./data/import_HS_2022.zip", base_file=base)
-merged.save_to_file(path="./data/normalized_2019_2022.csv", is_zip=False)
-```
-
-## Reporting and exploration: `TradeReport`
-
-`TradeReport` (in `src/japantrade/tradeanalysis.py`) provides lightweight analysis helpers on normalized data.
-
-### Current capability
-
-* **YoY country reports**: `yoy_country_report(kind="HS", country="220", method="last_12")` compares the latest 12 months to the prior period, optionally filtering by code length and units.
-
-### Example
-
-```python
-from japantrade.tradeanalysis import TradeReport
-
-report = TradeReport(source_file="./data/normalized_2019_2022.csv")
-italy_yoy = report.yoy_country_report(
-    kind="HS",
-    country="220",        # Italy
-    code_level=4,         # min code length
-    val_only=True,        # value (JPY) only
-    method="last_12"      # trailing 12 months vs prior 12
+italy = country_product_ranking(data, country="Italy", direction="export")
+cars = product_country_comparison(
+    data, countries=["Italy", "Germany", "USA"], codes=["8703"], direction="export"
 )
 ```
 
-The returned DataFrame is indexed by HS/PC code and unit, with trailing and prior-period sums ready for visualization in pandas/Seaborn/Matplotlib.
+Country inputs accept an official Japan Customs code or an exact English country name. HS searches accept text, exact codes, and code prefixes.
 
-## Streamlit app: Japan Trade Explorer
+## Data contract and interpretation
 
-The Streamlit dashboard (`src/japantrade/app.py`) ships with a bundled fixture (`tests/fixtures/normalized_sample.csv`) so you can explore immediately or upload your own normalized CSV.
+Prepared datasets require `direction`, `kind`, `country`, `code`, `date`, `unit`, and `value`. They may also contain `country_name` and `code_description`. Direction is part of a record identity, so imports and exports cannot overwrite one another.
 
-### Launch
+V1 comparisons use JPY value only. Quantity rows are preserved but are not comparable across different units. Rankings default to HS-4 and compare the latest 12 available months with the preceding 12 months; pass both `--date-start` and `--date-end` to choose another window.
 
-```bash
-streamlit run src/japantrade/app.py
-```
+Japan Customs rows use 9-digit tariff codes while the bundled HS lookup usually has 2-, 4-, and 6-digit entries. JapanTrade uses the most-specific available prefix description. Ranking reports label the requested HS level directly.
 
-### Features
+## Troubleshooting
 
-* **Data loading**: Upload normalized CSVs or rely on the bundled sample; data is validated via `load_normalized_data`.
-* **Filtering**: Sidebar controls for kind, countries, codes, units, and date range (auto-populated from available data).
-* **Summary metrics**: Total value KPI for the active filter set.
-* **Trends**: Year-over-year trend chart with validation for minimum monthly coverage.
-* **Top products**: Tabular and Altair bar views of top codes by value, plus a Plotly treemap for relative magnitude.
-* **Country comparison**: Aggregates by country (optionally scoped to a selected code) with charted results.
-* **Exports**: One-click downloads to DuckDB and SQLite files generated from the filtered dataset.
-* **Example queries**: Parameterized SQL snippets (DuckDB) such as top exporters in a date window and fastest-growing categories by year, runnable directly in-app.
+- **e-Stat timeout:** Retry a single year first. For a longer timeout, call `CustomsGrabber.grabRange(..., request_timeout=180)` from Python.
+- **“Insufficient data” in a ranking:** Run `dataset_coverage` through the MCP plugin or inspect dates/direction in the dataset. The default comparison needs two complete 12-month windows.
+- **Direction mismatch:** Do not combine imports and exports under one direction. Re-prepare raw files with the correct explicit direction.
+- **Missing descriptions:** Use `enrich_hs_descriptions` to refresh an existing prepared dataset, or re-run the ranking after upgrading JapanTrade.
 
-## Notebooks at a glance
+## Codex MCP plugin
 
-* **`src/japantrade/Trade Tools.ipynb`** – Walks through downloading data, normalizing it with `TradeFile`, and running first-pass plots.
-* **`src/japantrade/Trade data analysis.ipynb`** – Deeper exploratory analysis on prepared datasets (country/code slices, trend charts).
-* **`Japanese_HS_Codes.ipynb`** – Extracts HS code descriptions from provided tables, demonstrating code-to-description enrichment.
+The repository includes a local Codex plugin for prepared-dataset analysis. See the [MCP plugin guide](plugins/japantrade/README.md) for installation, tools, CSV export, examples, and troubleshooting.
 
-Open notebooks with:
+## Streamlit explorer
 
-```bash
-jupyter notebook src/japantrade/Trade\ Tools.ipynb
-```
+The exploratory Streamlit dashboard in `src/japantrade/app.py` provides filtering, charts, CSV export, and example DuckDB queries. It ships with the bundled fixture at `tests/fixtures/normalized_sample.csv`; you can also upload a normalized CSV.
 
-## Recent updates
-
-* Added the Streamlit-based Japan Trade Explorer with filtering, charts, exports, and runnable example queries.
-* Expanded normalization controls (base-unit conversion, keep/exclude filters, and warnings for unknown units) and added cached lookup enrichment to the pipeline.
-* Strengthened analysis helpers (`TradeReport`, `analytics.py`) for YoY/MoM trends, trailing totals, and top-product summaries.
-
-## Ideas and roadmap
-
-* CLI tooling: quick filters/aggregations from the terminal, plus CSV/Parquet export commands.
-* Performance: chunked CSV ingestion, faster melt paths, and Parquet/Feather outputs for large-scale workflows.
-* Automation: scheduled fetch + normalize pipelines with freshness monitoring and artifact publishing.
-* Visualization: additional Streamlit views (e.g., MoM trend comparisons, share-of-total charts) and optional alerting for large swings.
-* Data quality: richer validation with anomaly detection (e.g., outlier spikes/drops) and clearer warnings in the app/CLI.
-
-Contributions and issue reports are welcome—especially around performance tuning, schema validation, and visualization recipes.
+The legacy notebooks have been rewritten as current tutorials. The supported interfaces are the Python API, CLI, MCP server, and these notebooks; the Streamlit app remains exploratory.

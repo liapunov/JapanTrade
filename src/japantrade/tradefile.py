@@ -14,6 +14,7 @@ This module contains a single class, TradeFile.
 # coding: utf-8
 import os
 import logging
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -208,7 +209,9 @@ class NormalizationPipeline:
 
 
 class TradeFile():
-    PRIMARY_KEY = ['kind', 'country', 'code', 'date', 'unit']
+    # Direction is deliberately part of identity: imports and exports can have
+    # identical country/product/month values and must never overwrite each other.
+    PRIMARY_KEY = ['direction', 'kind', 'country', 'code', 'date', 'unit']
     """
     Trade data processing tool for the Japanese Customs database.
 
@@ -277,6 +280,12 @@ the data.
         output_formats : Iterable[str], optional
             Allowed output formats for saving normalized data.
         """
+        if direction not in {'import', 'export'}:
+            raise ValueError("direction must be either 'import' or 'export'.")
+        self.direction = direction
+        source = str(source) if source is not None else None
+        base_file = str(base_file) if base_file is not None else None
+        self.source = str(source) if source is not None else None
         if source is None:
             raise ValueError("You must specify the source file. Use raw=False\
                              if the file is already in normal form.")
@@ -300,9 +309,13 @@ the data.
         if base_file is not None:
             self.data, self.kind = self._openNormalFile(base_file, kind)
             self.data = self._ensure_kind_column(self.data, self.kind)
+            self.data = self._ensure_direction_column(self.data, direction, legacy_ok=False)
             self.data = self._acquireNewData(new_file=source, kind=kind)
         elif base_df is not None:
             self.data, self.kind = self._ensure_kind_column(base_df, kind), kind
+            # An in-memory dataframe is paired with an explicit direction
+            # argument, making this a safe migration boundary.
+            self.data = self._ensure_direction_column(self.data, direction)
             self.data = self._acquireNewData(new_file=source, kind=kind)
         elif raw:
             log.warning("Warning: this operation might take more than one \
@@ -310,9 +323,31 @@ the data.
             self.data, self.kind = self._dfFromRaw(
                 source, kind, chunk_size=self.chunk_size)
             self.data = self._ensure_kind_column(self.data, self.kind)
+            self.data = self._ensure_direction_column(self.data, direction)
         else:
             self.data, self.kind = self._openNormalFile(source, kind)
             self.data = self._ensure_kind_column(self.data, self.kind)
+            self.data = self._ensure_direction_column(self.data, direction, legacy_ok=False)
+
+    def _ensure_direction_column(self, df, direction, legacy_ok=True):
+        """Attach a direction to raw-normalized data and validate saved data."""
+        result = df.copy()
+        if 'direction' not in result.columns:
+            if not legacy_ok:
+                raise ValueError(
+                    "This normalized dataset has no 'direction' column. "
+                    "Re-run `japantrade prepare` from the raw archive, or explicitly migrate it."
+                )
+            result['direction'] = direction
+        values = set(result['direction'].dropna().astype(str).unique())
+        if not values.issubset({'import', 'export'}):
+            raise ValueError("Normalized data contains invalid direction values.")
+        if values and values != {direction}:
+            raise ValueError(
+                f"Direction mismatch: this operation is configured for {direction!r}, "
+                f"but the dataset contains {sorted(values)!r}."
+            )
+        return result
 
     def _ensure_kind_column(self, df, kind, update_attr: bool = True):
         """Ensure the dataframe contains a consistent 'kind' column."""
@@ -548,6 +583,7 @@ the data.
         def process(idx, chunk):
             reduced, metrics = pipeline.run(chunk, inferred_kind, chunk_index=idx)
             reduced['kind'] = inferred_kind
+            reduced['direction'] = self.direction
             self._persist_chunk(reduced, idx)
             return idx, reduced, metrics
 
@@ -705,10 +741,13 @@ the data.
         If the file is a single csv, it is streamed in chunks as well.
 
         """
-        trade_types = {'Year': 'string', 'HS': 'category',
-                       'Country': 'category', 'Commodity': 'category',
-                       'Unit1': 'category', 'Unit2': 'category',
-                       'Unit': 'category'}
+        # Codes and units are identifiers, not categorical analysis columns.
+        # String dtype keeps category sets from separate raw files/units from
+        # conflicting during the quantity-unit melt.
+        trade_types = {'Year': 'string', 'HS': 'string',
+                       'Country': 'string', 'Commodity': 'string',
+                       'Unit1': 'string', 'Unit2': 'string',
+                       'Unit': 'string'}
 
         print("Loading the file in streaming mode...")
         chunksize = chunk_size or self.chunk_size
@@ -778,9 +817,10 @@ No data were acquired.")
         pd.DataFrame
             a Pandas DataFrame with the trade data already normalized
         """
-        trade_types = {'HS': 'category', 'Country': 'category',
-                       'code': 'category',
-                       'date': object, 'unit': 'category', 'value': 'Int64'}
+        trade_types = {'HS': 'string', 'Country': 'string', 'country': 'string',
+                       'direction': 'string',
+                       'code': 'string',
+                       'date': object, 'unit': 'string', 'value': 'Int64'}
         df = self._opener()[filename[-3:]](filename, trade_types, raw=False)
         if kind == 'infer':
             kind = self._infer_kind(df, raw=False)
@@ -1081,10 +1121,12 @@ No data were acquired.")
 
         code_lookup = self._code_lookup(kind)
         if code_lookup is not None and not code_lookup.empty:
-            before = len(enriched)
-            enriched = enriched.merge(code_lookup, how="left", on="code")
+            # Customs reports use 9-digit tariff codes, while the packaged HS
+            # dictionary has descriptions at shorter hierarchy levels.
+            from .analytics import enrich_hs_descriptions
+            enriched = enrich_hs_descriptions(enriched)
             missing_codes = enriched["code_description"].isna().sum()
-            metrics["code_enriched"] = int(before - missing_codes)
+            metrics["code_enriched"] = int(len(enriched) - missing_codes)
             metrics["missing_code_descriptions"] = int(missing_codes)
         elif self.normalization_config.warn_on_unknown:
             log.warning("Code lookup for kind '%s' unavailable; skipping code enrichment.", kind)
@@ -1133,6 +1175,8 @@ No data were acquired.")
         if date_range is not None and (not isinstance(date_range, (list, tuple)) or len(date_range) != 2):
             raise ValueError("date_range must be a tuple or list of two date strings (start, end).")
 
+        direction = getattr(self, "direction", "import")
+        self.data = self._ensure_direction_column(self.data, direction)
         base_snapshot = self._snapshot_state(self.data)
         existing_kind = getattr(self, "kind", None)
         if new_file is not None:
@@ -1149,6 +1193,7 @@ files were provided as merge parameters. The dataframe will be ignored.")
             new_data = self._ensure_kind_column(new_data, kind)
         elif new_df is not None:
             new_data = self._ensure_kind_column(new_df, kind, update_attr=False)
+            new_data = self._ensure_direction_column(new_data, direction)
         else:
             # no file or DataFrame to merge with
             return self.data
@@ -1201,6 +1246,7 @@ files were provided as merge parameters. The dataframe will be ignored.")
         """
         if not hasattr(self, "normalization_config") or self.normalization_config is None:
             self.normalization_config = NormalizationConfig()
+        self.data = self._ensure_direction_column(self.data, getattr(self, "direction", "import"))
         resolved_fmt = fmt.lower() if fmt else None
         if resolved_fmt and resolved_fmt not in self.normalization_config.output_formats:
             raise ValueError(
@@ -1239,4 +1285,17 @@ files were provided as merge parameters. The dataframe will be ignored.")
             }
         )
         log.info(f"TradeFile.save_to_file: saved data to {target_path}.")
+        metadata = {
+            "schema_version": 1,
+            "kind": self.kind,
+            "directions": sorted(self.data["direction"].astype(str).unique()),
+            "source_files": [self.source] if getattr(self, "source", None) else [],
+            "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "min_date": str(pd.to_datetime(self.data["date"]).min().date()),
+            "max_date": str(pd.to_datetime(self.data["date"]).max().date()),
+            "rows": int(len(self.data)),
+        }
+        target_path.with_suffix(target_path.suffix + ".metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
         return target_path

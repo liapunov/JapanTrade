@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "japantrade": {
+      "command": "uv",
+      "args": ["run", "japantrade-mcp"],
+      "cwd": "../..",
+      "tool_timeout_sec": 300
+    }
+  }
+}

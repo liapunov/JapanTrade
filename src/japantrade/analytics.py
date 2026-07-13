@@ -1,14 +1,15 @@
+"""Analysis helpers for prepared Japanese Customs HS trade datasets."""
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-import altair as alt
 import pandas as pd
 
-DEFAULT_DATE_FREQ = "MS"
-DEFAULT_GROUP_KEYS = ["kind", "country", "code", "unit"]
+VALUE_UNIT = "JPY"
+REQUIRED_COLUMNS = {"direction", "kind", "country", "code", "date", "unit", "value"}
 
 
 @dataclass
@@ -21,299 +22,260 @@ class FilterOptions:
     max_date: pd.Timestamp
 
 
-def load_normalized_data(source: str | io.BytesIO | io.StringIO) -> pd.DataFrame:
-    """Load normalized trade data from csv-like sources.
-
-    Examples
-    --------
-    >>> import io
-    >>> sample = io.StringIO("kind,country,code,date,unit,value\\nHS,001,0101,2023-01-01,JPY,100")
-    >>> load_normalized_data(sample).iloc[0].date  # doctest: +ELLIPSIS
-    Timestamp('2023-01-01 ...')
-    """
-    df = pd.read_csv(
-        source,
-        dtype={
-            "kind": str,
-            "country": str,
-            "code": str,
-            "unit": str,
-            "date": str,
-            "value": "float64",
-        },
-    )
-    expected_cols = {"kind", "country", "code", "date", "unit", "value"}
-    missing = expected_cols - set(df.columns)
+def load_normalized_data(source: str | Path | io.BytesIO | io.StringIO) -> pd.DataFrame:
+    """Load a prepared CSV or Parquet dataset and validate its v1 schema."""
+    path = str(source) if isinstance(source, (str, Path)) else None
+    df = pd.read_parquet(source) if path and path.endswith(".parquet") else pd.read_csv(source, dtype=str)
+    missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
+        if missing == {"direction"}:
+            raise ValueError("Dataset has no 'direction' column. Re-run `japantrade prepare` from raw data.")
         raise ValueError(f"Missing expected columns: {', '.join(sorted(missing))}")
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"])
-    return df
+    result = df.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="raise")
+    result["value"] = pd.to_numeric(result["value"], errors="raise")
+    result["country"] = result["country"].astype(str).str.zfill(3)
+    result["code"] = result["code"].astype(str).str.replace(r"\s+", "", regex=True)
+    if not set(result["direction"].unique()).issubset({"import", "export"}):
+        raise ValueError("direction must contain only 'import' and 'export'.")
+    return result
 
 
-def available_filters(df: pd.DataFrame) -> FilterOptions:
-    return FilterOptions(
-        kinds=sorted(df["kind"].unique()),
-        countries=sorted(df["country"].unique()),
-        codes=sorted(df["code"].unique()),
-        units=sorted(df["unit"].unique()),
-        min_date=pd.to_datetime(df["date"]).min(),
-        max_date=pd.to_datetime(df["date"]).max(),
-    )
+def available_filters(df: pd.DataFrame):
+    """Compatibility helper describing selectable fields."""
+    return FilterOptions(sorted(df.kind.unique()), sorted(df.country.unique()), sorted(df.code.unique()),
+                         sorted(df.unit.unique()), pd.to_datetime(df.date).min(), pd.to_datetime(df.date).max())
 
 
-def _normalize_dates(df: pd.DataFrame) -> pd.DataFrame:
-    normalized = df.copy()
-    normalized["date"] = pd.to_datetime(normalized["date"])
-    return normalized
-
-
-def _format_group_label(group_keys: Sequence[str], values: tuple[str, ...] | str) -> str:
-    if not isinstance(values, tuple):
-        values = (values,)
-    return ", ".join(f"{key}={value}" for key, value in zip(group_keys, values))
-
-
-def _ensure_month_window(
-    monthly_df: pd.DataFrame,
-    group_keys: Sequence[str],
-    months_needed: int,
-    label: str,
-) -> None:
-    """Validate that each group has consecutive monthly coverage."""
-    if monthly_df.empty:
-        raise ValueError(f"Cannot compute {label}: no data provided.")
-    monthly_df = monthly_df.copy()
-    monthly_df["period"] = pd.to_datetime(monthly_df["date"]).dt.to_period("M")
-
-    for group_values, group in monthly_df.groupby(group_keys):
-        unique_periods = set(group["period"].unique())
-        if len(unique_periods) < months_needed:
-            raise ValueError(
-                f"Cannot compute {label} for {_format_group_label(group_keys, group_values)}: "
-                f"need at least {months_needed} consecutive months, found {len(unique_periods)}."
-            )
-        end_period = max(unique_periods)
-        start_period = end_period - (months_needed - 1)
-        expected = pd.period_range(start=start_period, end=end_period, freq="M")
-        missing = [period for period in expected if period not in unique_periods]
-        if missing:
-            missing_str = ", ".join(period.strftime("%Y-%m") for period in missing)
-            raise ValueError(
-                f"Cannot compute {label} for {_format_group_label(group_keys, group_values)}: "
-                f"missing months {missing_str}."
-            )
-
-
-def filter_dataframe(
-    df: pd.DataFrame,
-    kind: Optional[str] = None,
-    countries: Optional[Iterable[str]] = None,
-    codes: Optional[Iterable[str]] = None,
-    units: Optional[Iterable[str]] = None,
-    date_range: Optional[tuple[pd.Timestamp, pd.Timestamp]] = None,
-) -> pd.DataFrame:
-    """Apply simple filters to the normalized dataframe."""
-    return apply_parameterized_filters(
-        df,
-        kind=kind,
-        countries=countries,
-        codes=codes,
-        units=units,
-        date_range=date_range,
-    )
-
-
-def apply_parameterized_filters(
-    df: pd.DataFrame,
-    kind: Optional[str] = None,
-    countries: Optional[Iterable[str]] = None,
-    country_prefixes: Optional[Iterable[str]] = None,
-    codes: Optional[Iterable[str]] = None,
-    code_prefixes: Optional[Iterable[str]] = None,
-    units: Optional[Iterable[str]] = None,
-    date_range: Optional[tuple[pd.Timestamp, pd.Timestamp]] = None,
-) -> pd.DataFrame:
-    """Apply rich, parameterized filters.
-
-    Parameters
-    ----------
-    kind : str, optional
-        Restrict to a specific code kind (e.g. ``"HS"`` or ``"PC"``).
-    countries : iterable of str, optional
-        Explicit list of country codes to keep.
-    country_prefixes : iterable of str, optional
-        Prefixes that should match country codes (e.g. ``["00"]``).
-    codes : iterable of str, optional
-        Explicit list of HS/PC codes to keep.
-    code_prefixes : iterable of str, optional
-        Prefix filters for HS/PC codes (e.g. ``["010", "0203"]``).
-    units : iterable of str, optional
-        Acceptable measurement units.
-    date_range : tuple of Timestamp, optional
-        Inclusive date range filter.
-
-    Examples
-    --------
-    >>> data = pd.DataFrame({\n\
-    ...     "kind": ["HS"] * 2,\n\
-    ...     "country": ["001", "009"],\n\
-    ...     "code": ["0101", "0301"],\n\
-    ...     "date": ["2023-01-01", "2023-02-01"],\n\
-    ...     "unit": ["JPY", "JPY"],\n\
-    ...     "value": [1, 2],\n\
-    ... })\n\
-    >>> apply_parameterized_filters(data, country_prefixes=["00"])["country"].unique()\n\
-    array(['001'], dtype=object)\n\
-    """
-    filtered = _normalize_dates(df)
-    if kind:
-        filtered = filtered[filtered["kind"] == kind]
-
+def apply_parameterized_filters(df: pd.DataFrame, kind: Optional[str] = None,
+                                countries: Optional[Iterable[str]] = None,
+                                country_prefixes: Optional[Iterable[str]] = None,
+                                codes: Optional[Iterable[str]] = None,
+                                code_prefixes: Optional[Iterable[str]] = None,
+                                units: Optional[Iterable[str]] = None,
+                                date_range: Optional[tuple[pd.Timestamp, pd.Timestamp]] = None,
+                                direction: Optional[str] = None) -> pd.DataFrame:
+    result = df.copy()
+    result["date"] = pd.to_datetime(result["date"])
+    if kind: result = result[result.kind == kind]
+    if direction: result = result[result.direction == direction]
     if countries or country_prefixes:
-        allowed_countries = set(countries or [])
+        allowed = set(str(x).zfill(3) for x in (countries or []))
         if country_prefixes:
-            prefixes = tuple(country_prefixes)
-            allowed_countries.update(filtered.loc[filtered["country"].str.startswith(prefixes), "country"])
-        filtered = filtered[filtered["country"].isin(allowed_countries)]
-
+            allowed.update(result.loc[result.country.astype(str).str.startswith(tuple(country_prefixes)), "country"])
+        result = result[result.country.isin(allowed)]
     if codes or code_prefixes:
-        allowed_codes = set(codes or [])
+        allowed = set(str(x) for x in (codes or []))
         if code_prefixes:
-            prefixes = tuple(code_prefixes)
-            allowed_codes.update(filtered.loc[filtered["code"].str.startswith(prefixes), "code"])
-        filtered = filtered[filtered["code"].isin(allowed_codes)]
-
-    if units:
-        filtered = filtered[filtered["unit"].isin(set(units))]
-    if date_range:
-        start, end = date_range
-        filtered = filtered[(filtered["date"] >= start) & (filtered["date"] <= end)]
-    return filtered
+            allowed.update(result.loc[result.code.astype(str).str.startswith(tuple(code_prefixes)), "code"])
+        result = result[result.code.isin(allowed)]
+    if units: result = result[result.unit.isin(set(units))]
+    if date_range: result = result[result.date.between(*date_range)]
+    return result
 
 
-def _resample_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    normalized = _normalize_dates(df)
-    return (
-        normalized.groupby(DEFAULT_GROUP_KEYS + [pd.Grouper(key="date", freq=DEFAULT_DATE_FREQ)])["value"]
-        .sum()
-        .reset_index()
-        .sort_values("date")
-    )
+def filter_dataframe(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    return apply_parameterized_filters(df, **kwargs)
+
+
+def _value_data(df: pd.DataFrame, direction: str) -> pd.DataFrame:
+    if direction not in {"import", "export"}:
+        raise ValueError("direction must be 'import' or 'export'.")
+    result = df[(df["direction"] == direction) & (df["kind"] == "HS") & (df["unit"] == VALUE_UNIT)].copy()
+    result["date"] = pd.to_datetime(result["date"])
+    if result.empty:
+        raise ValueError("No HS JPY-value rows match the requested direction.")
+    return result
+
+
+def _period_bounds(df: pd.DataFrame, period: Optional[tuple[object, object]] = None) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    if period:
+        start, end = (pd.Timestamp(value).to_period("M").to_timestamp() for value in period)
+        months = (end.year - start.year) * 12 + end.month - start.month + 1
+        if months < 1: raise ValueError("period end must be on or after period start.")
+    else:
+        latest = pd.to_datetime(df.date).max().to_period("M").to_timestamp()
+        start, end, months = latest - pd.DateOffset(months=11), latest, 12
+    previous_end = start - pd.DateOffset(months=1)
+    previous_start = previous_end - pd.DateOffset(months=months - 1)
+    return previous_start, previous_end, start, end
+
+
+def coverage_report(df: pd.DataFrame, group_by: Sequence[str] = ("direction", "country", "code")) -> pd.DataFrame:
+    """Report expected versus observed monthly coverage for every series."""
+    data = df.copy(); data["date"] = pd.to_datetime(data.date).dt.to_period("M")
+    rows = []
+    for keys, group in data.groupby(list(group_by)):
+        periods = sorted(group.date.unique())
+        expected = pd.period_range(periods[0], periods[-1], freq="M") if periods else []
+        rows.append(dict(zip(group_by, keys if isinstance(keys, tuple) else (keys,)),
+                         first_month=str(periods[0]), last_month=str(periods[-1]),
+                         observed_months=len(periods), missing_months=len(expected) - len(periods)))
+    return pd.DataFrame(rows)
+
+
+def _resolve_country(df: pd.DataFrame, country: str) -> str:
+    candidate = str(country).strip()
+    if candidate.isdigit():
+        candidate = candidate.zfill(3)
+        if candidate in set(df.country.astype(str)): return candidate
+    if "country_name" in df:
+        matches = df.loc[df.country_name.astype(str).str.casefold() == candidate.casefold(), "country"].unique()
+        if len(matches) == 1: return str(matches[0])
+    raise ValueError(f"Unknown or ambiguous country: {country!r}. Use a Japan Customs code or an exact country name.")
+
+
+def country_product_ranking(df: pd.DataFrame, country: str, direction: str,
+                            period: Optional[tuple[object, object]] = None,
+                            hs_level: int = 4, limit: int = 20) -> pd.DataFrame:
+    """Rank HS prefixes for one trading partner by current-period JPY value."""
+    if hs_level not in {2, 4, 6}: raise ValueError("hs_level must be one of 2, 4, or 6.")
+    data = _value_data(df, direction); country_code = _resolve_country(data, country)
+    data = data[data.country == country_code].copy()
+    previous_start, previous_end, start, end = _period_bounds(data, period)
+    current = data[data.date.between(start, end)]; previous = data[data.date.between(previous_start, previous_end)]
+    if current.empty or previous.empty: raise ValueError("Insufficient data for the requested comparison window.")
+    for frame in (current, previous): frame["hs_code"] = frame.code.str[:hs_level]
+    current_totals = current.groupby("hs_code").value.sum().rename("current_value")
+    previous_totals = previous.groupby("hs_code").value.sum().rename("prior_value")
+    result = pd.concat([current_totals, previous_totals], axis=1).fillna(0).reset_index()
+    result["absolute_change"] = result.current_value - result.prior_value
+    result["growth"] = result.absolute_change.div(result.prior_value.where(result.prior_value != 0))
+    result["share"] = result.current_value / result.current_value.sum()
+    result["rank"] = result.current_value.rank(method="first", ascending=False).astype(int)
+    description_lookup = enrich_hs_descriptions(
+        pd.DataFrame({"code": result["hs_code"]})
+    ).rename(columns={"code": "hs_code"})
+    result = result.merge(description_lookup[["hs_code", "code_description"]], on="hs_code", how="left")
+    result["country"] = country_code; result["direction"] = direction; result["period_start"] = start; result["period_end"] = end
+    return result.sort_values("rank").head(limit).reset_index(drop=True)
+
+
+def product_country_comparison(df: pd.DataFrame, countries: Iterable[str], codes: Iterable[str], direction: str,
+                               period: Optional[tuple[object, object]] = None) -> pd.DataFrame:
+    """Compare selected HS code prefixes across countries using JPY values."""
+    data = _value_data(df, direction)
+    country_codes = [_resolve_country(data, country) for country in countries]
+    prefixes = tuple(str(code).replace(" ", "") for code in codes)
+    data = data[data.country.isin(country_codes) & data.code.str.startswith(prefixes)].copy()
+    previous_start, previous_end, start, end = _period_bounds(data, period)
+    current = data[data.date.between(start, end)].groupby("country").value.sum().rename("current_value")
+    previous = data[data.date.between(previous_start, previous_end)].groupby("country").value.sum().rename("prior_value")
+    result = pd.concat([current, previous], axis=1).fillna(0).reset_index()
+    result["absolute_change"] = result.current_value - result.prior_value
+    result["growth"] = result.absolute_change.div(result.prior_value.where(result.prior_value != 0))
+    result["selected_market_share"] = result.current_value / result.current_value.sum()
+    result["direction"] = direction; result["period_start"] = start; result["period_end"] = end
+    if "country_name" in data: result = result.merge(data[["country", "country_name"]].drop_duplicates(), on="country", how="left")
+    return result.sort_values("current_value", ascending=False).reset_index(drop=True)
+
+
+def trade_timeseries(df: pd.DataFrame, countries: Iterable[str], codes: Iterable[str], direction: str) -> pd.DataFrame:
+    data = _value_data(df, direction)
+    country_codes = [_resolve_country(data, country) for country in countries]
+    prefixes = tuple(str(code) for code in codes)
+    return (data[data.country.isin(country_codes) & data.code.str.startswith(prefixes)]
+            .groupby(["country", "date"], as_index=False).value.sum().sort_values(["country", "date"]))
+
+
+def search_hs(query: str, level: Optional[int] = None, limit: int = 20) -> pd.DataFrame:
+    """Search packaged HS descriptions by keyword, exact code, or code prefix."""
+    path = Path(__file__).with_name("HScodes.csv")
+    lookup = pd.read_csv(path, sep=";", dtype=str)
+    code_col = "Code.1" if "Code.1" in lookup else "Code"
+    lookup = lookup.rename(columns={code_col: "code", "Description": "description", "Level": "level"})
+    lookup["code"] = lookup.code.fillna("").str.replace(r"\s+", "", regex=True)
+    lookup["level"] = pd.to_numeric(lookup.level, errors="coerce")
+    term = str(query).strip()
+    matched = lookup.code.str.startswith(term) if term.isdigit() else lookup.description.fillna("").str.contains(term, case=False, regex=False)
+    result = lookup.loc[matched, ["code", "level", "description"]].dropna(subset=["code"])
+    if level is not None: result = result[result.level == level]
+    return result.drop_duplicates("code").head(limit).reset_index(drop=True)
+
+
+def enrich_hs_descriptions(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach the most specific available HS description to each HS code.
+
+    Japan Customs rows use 9-digit tariff codes while the packaged HS lookup
+    primarily contains 2-, 4-, and 6-digit international HS levels.  A row is
+    therefore matched first by exact code and then by its longest lookup prefix.
+    """
+    result = df.copy()
+    if "code" not in result:
+        raise ValueError("Cannot enrich descriptions: missing 'code' column.")
+    lookup_path = Path(__file__).with_name("HScodes.csv")
+    lookup = pd.read_csv(lookup_path, sep=";", dtype=str)
+    code_column = "Code.1" if "Code.1" in lookup else "Code"
+    lookup = lookup.rename(columns={code_column: "code", "Description": "code_description"})
+    lookup["code"] = lookup.code.fillna("").str.replace(r"\s+", "", regex=True)
+    lookup = lookup[(lookup.code != "") & lookup.code_description.notna()].drop_duplicates("code")
+
+    codes = result.code.astype(str).str.replace(r"\s+", "", regex=True)
+    descriptions = result["code_description"].copy() if "code_description" in result else pd.Series(pd.NA, index=result.index, dtype="object")
+    lengths = sorted(lookup.code.str.len().unique(), reverse=True)
+    for length in lengths:
+        missing = descriptions.isna()
+        if not missing.any():
+            break
+        mapping = lookup.loc[lookup.code.str.len() == length].set_index("code")["code_description"]
+        descriptions.loc[missing] = codes.loc[missing].str[:length].map(mapping)
+    result["code_description"] = descriptions
+    return result
+
+
+# Lightweight backwards-compatible helpers.
+def top_products_by_value(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    return df.groupby(["kind", "code"], as_index=False).value.sum().sort_values("value", ascending=False).head(top_n)
+
+def country_comparison(df: pd.DataFrame, code: Optional[str] = None) -> pd.DataFrame:
+    data = df[df.code == code] if code else df
+    return data.groupby(["country", "kind"], as_index=False).value.sum().sort_values("value", ascending=False)
+
+
+def _monthly(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy(); data["date"] = pd.to_datetime(data.date)
+    keys = [key for key in ("direction", "kind", "country", "code", "unit") if key in data]
+    return data.groupby(keys + [pd.Grouper(key="date", freq="MS")], as_index=False).value.sum().sort_values("date")
+
+
+def _check_consecutive(monthly: pd.DataFrame, keys: Sequence[str], needed: int, label: str) -> None:
+    for values, group in monthly.groupby(list(keys)):
+        periods = set(group.date.dt.to_period("M")); end = max(periods); expected = pd.period_range(end - (needed - 1), end, freq="M")
+        if any(period not in periods for period in expected):
+            raise ValueError(f"Cannot compute {label}: need {needed} consecutive months for {values}.")
 
 
 def year_over_year_trends(df: pd.DataFrame) -> pd.DataFrame:
-    """Return YoY growth by country/code/unit.
-
-    Raises
-    ------
-    ValueError
-        If there are fewer than 13 consecutive months per group.
-    """
-    monthly = _resample_monthly(df)
-    _ensure_month_window(monthly, DEFAULT_GROUP_KEYS, 13, "year-over-year change")
-    monthly["yoy_value"] = monthly.groupby(DEFAULT_GROUP_KEYS)["value"].pct_change(periods=12)
-    if not monthly["yoy_value"].notna().any():
-        raise ValueError("Not enough data to compute year-over-year change for any group.")
+    monthly = _monthly(df); keys = [key for key in ("direction", "kind", "country", "code", "unit") if key in monthly]
+    _check_consecutive(monthly, keys, 13, "year-over-year change")
+    monthly["yoy_value"] = monthly.groupby(keys).value.pct_change(12)
     return monthly
 
 
 def month_over_month_trends(df: pd.DataFrame) -> pd.DataFrame:
-    """Return MoM growth by country/code/unit with validation."""
-    monthly = _resample_monthly(df)
-    _ensure_month_window(monthly, DEFAULT_GROUP_KEYS, 2, "month-over-month change")
-    monthly["mom_value"] = monthly.groupby(DEFAULT_GROUP_KEYS)["value"].pct_change(periods=1)
-    if not monthly["mom_value"].notna().any():
-        raise ValueError("Not enough data to compute month-over-month change for any group.")
+    monthly = _monthly(df); keys = [key for key in ("direction", "kind", "country", "code", "unit") if key in monthly]
+    _check_consecutive(monthly, keys, 2, "month-over-month change")
+    monthly["mom_value"] = monthly.groupby(keys).value.pct_change()
     return monthly
 
 
 def trailing_12_month_totals(df: pd.DataFrame) -> pd.DataFrame:
-    """Return trailing 12-month totals by group.
-
-    Examples
-    --------
-    >>> data = pd.DataFrame({\n\
-    ...     "kind": ["HS"] * 12,\n\
-    ...     "country": ["001"] * 12,\n\
-    ...     "code": ["0101"] * 12,\n\
-    ...     "date": pd.date_range(\"2022-01-01\", periods=12, freq=\"MS\"),\n\
-    ...     "unit": ["JPY"] * 12,\n\
-    ...     "value": [1] * 12,\n\
-    ... })\n\
-    >>> trailing_12_month_totals(data).iloc[-1].trailing_12_value\n\
-    12.0\n\
-    """
-    monthly = _resample_monthly(df)
-    _ensure_month_window(monthly, DEFAULT_GROUP_KEYS, 12, "trailing 12-month totals")
-    monthly["trailing_12_value"] = (
-        monthly.sort_values("date")
-        .groupby(DEFAULT_GROUP_KEYS)["value"]
-        .transform(lambda series: series.rolling(window=12, min_periods=12).sum())
-    )
-    if monthly["trailing_12_value"].isna().all():
-        raise ValueError("Not enough data to compute trailing 12-month totals for any group.")
+    monthly = _monthly(df); keys = [key for key in ("direction", "kind", "country", "code", "unit") if key in monthly]
+    _check_consecutive(monthly, keys, 12, "trailing 12-month totals")
+    monthly["trailing_12_value"] = monthly.groupby(keys).value.transform(lambda values: values.rolling(12, min_periods=12).sum())
     return monthly
 
 
-def top_products_by_value(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
-    grouped = (
-        df.groupby(["kind", "code"])["value"]
-        .sum()
-        .reset_index()
-        .sort_values("value", ascending=False)
-    )
-    return grouped.head(top_n)
+def yoy_chart(trends):
+    import altair as alt
+    return alt.Chart(trends).mark_line(point=True).encode(x="date:T", y="yoy_value:Q", color="code:N")
 
 
-def country_comparison(df: pd.DataFrame, code: Optional[str] = None) -> pd.DataFrame:
-    scoped = df[df["code"] == code] if code else df
-    return (
-        scoped.groupby(["country", "kind"])["value"]
-        .sum()
-        .reset_index()
-        .sort_values("value", ascending=False)
-    )
+def top_products_chart(data):
+    import altair as alt
+    return alt.Chart(data).mark_bar().encode(x="value:Q", y=alt.Y("code:N", sort="-x"))
 
 
-def yoy_chart(trends: pd.DataFrame) -> alt.Chart:
-    return (
-        alt.Chart(trends)
-        .mark_line(point=True)
-        .encode(
-            x="date:T",
-            y=alt.Y("yoy_value:Q", title="YoY growth"),
-            color="code:N",
-            tooltip=["country", "code", "date", "yoy_value"],
-        )
-        .properties(title="Year-over-year trend")
-    )
-
-
-def top_products_chart(top_df: pd.DataFrame) -> alt.Chart:
-    return (
-        alt.Chart(top_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("value:Q", title="Value"),
-            y=alt.Y("code:N", sort="-x", title="Product code"),
-            color="kind:N",
-            tooltip=["code", "kind", "value"],
-        )
-        .properties(title="Top products by value")
-    )
-
-
-def country_comparison_chart(df: pd.DataFrame) -> alt.Chart:
-    return (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X("country:N", title="Country"),
-            y=alt.Y("value:Q", title="Value"),
-            color="kind:N",
-            tooltip=["country", "kind", "value"],
-        )
-        .properties(title="Country comparison")
-    )
+def country_comparison_chart(data):
+    import altair as alt
+    return alt.Chart(data).mark_bar().encode(x="country:N", y="value:Q")

@@ -117,6 +117,12 @@ class CustomsGrabber():
                 and self.last.
 
         """
+        if kind not in self.dir_params:
+            raise ValueError("kind must be either 'HS' or 'PC'.")
+        if direction not in self.dir_params[kind]:
+            raise ValueError("direction must be either 'import' or 'export'.")
+        if from_year > to_year:
+            raise ValueError("from_year must be on or before to_year.")
         if to_year > self.last or from_year < self.first:
             raise ValueError(f"The range {from_year}-{to_year} is out of\
                              bound.\
@@ -148,11 +154,14 @@ class CustomsGrabber():
 
         # if there are too many files the GET request becomes too long
         # (the limit is 2048 characters) and we need to split it.
-        num_splits = (len(files) // 100) + 1
+        if not files:
+            raise ValueError("No CSV releases were found for the requested range.")
+        num_splits = (len(files) + 99) // 100
         if num_splits > 1 and not allow_large_download:
             raise ValueError("Download exceeds 100 files. Set "
                              "allow_large_download=True to proceed.")
 
+        saved_paths = []
         for i in range(num_splits):
             # create chunk of max 100 files
             files_chunk = files[100 * i: min(len(files), 100 * (i + 1))]
@@ -177,6 +186,8 @@ class CustomsGrabber():
                     if chunk:
                         f.write(chunk)
             print(f"Saved the data as {file_path}.")
+            saved_paths.append(file_path)
+        return saved_paths
 
     def grabAll(self, direction='import', kind='HS', save_folder=None,
                 allow_large_download=False, request_timeout=30):

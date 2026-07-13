@@ -12,9 +12,9 @@ assignees: ''
 
 ## Steps to reproduce
 
-1. 
-2. 
-3. 
+1.
+2.
+3.
 
 ## Expected behavior
 
@@ -26,10 +26,10 @@ assignees: ''
 
 ## Environment
 
-- OS: 
-- Python version: 
-- Package versions: 
-- Data sample or source (if applicable): 
+- OS:
+- Python version:
+- Package versions:
+- Data sample or source (if applicable):
 
 ## Additional context
 

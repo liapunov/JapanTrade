@@ -1,0 +1,4 @@
+interface:
+  display_name: "JapanTrade Analysis"
+  short_description: "Analyze Japan trade datasets."
+  default_prompt: "Analyze a JapanTrade dataset and export the result if needed."
