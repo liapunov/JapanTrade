@@ -19,8 +19,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install locked development dependencies
-        run: uv sync --extra dev --locked
+      - name: Install development dependencies
+        run: uv sync --extra dev
 
       - name: Run tests
         run: uv run pytest -q

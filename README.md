@@ -12,7 +12,7 @@ Python 3.10+ is required. Use Parquet for prepared datasets.
 pip install "japantrade[parquet]"
 ```
 
-For repository development, use the locked environment:
+For repository development, create a development environment:
 
 ```bash
 uv sync --extra dev
@@ -90,5 +90,9 @@ Japan Customs rows use 9-digit tariff codes while the bundled HS lookup usually 
 ## Codex MCP plugin
 
 The repository includes a local Codex plugin for prepared-dataset analysis. See the [MCP plugin guide](plugins/japantrade/README.md) for installation, tools, CSV export, examples, and troubleshooting.
+
+## Streamlit explorer
+
+The exploratory Streamlit dashboard in `src/japantrade/app.py` provides filtering, charts, CSV export, and example DuckDB queries. It ships with the bundled fixture at `tests/fixtures/normalized_sample.csv`; you can also upload a normalized CSV.
 
 The legacy notebooks have been rewritten as current tutorials. The supported interfaces are the Python API, CLI, MCP server, and these notebooks; the Streamlit app remains exploratory.
