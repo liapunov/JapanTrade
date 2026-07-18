@@ -11,6 +11,7 @@ import pandas as pd
 from .schema import (
     deduplicate_normalized_data,
     validate_direction_values,
+    validate_non_null_values,
     validate_required_columns,
 )
 
@@ -33,6 +34,7 @@ def load_normalized_data(source: str | Path | io.BytesIO | io.StringIO) -> pd.Da
     df = pd.read_parquet(source) if path and path.endswith(".parquet") else pd.read_csv(source, dtype=str)
     validate_required_columns(df)
     result = df.copy()
+    validate_non_null_values(result)
     result["date"] = pd.to_datetime(result["date"], errors="raise")
     result["value"] = pd.to_numeric(result["value"], errors="raise")
     result["country"] = result["country"].astype(str).str.zfill(3)
@@ -82,6 +84,7 @@ def _value_data(df: pd.DataFrame, direction: str) -> pd.DataFrame:
     if direction not in {"import", "export"}:
         raise ValueError("direction must be 'import' or 'export'.")
     validate_required_columns(df)
+    validate_non_null_values(df)
     validate_direction_values(df["direction"].unique())
     normalized = df.copy()
     normalized["date"] = pd.to_datetime(normalized["date"], errors="raise")
@@ -148,16 +151,44 @@ def _normalize_prefixes(codes: Iterable[str]) -> tuple[str, ...]:
     return tuple(prefix for prefix in cleaned if not any(prefix.startswith(other) for other in cleaned if prefix != other))
 
 
-def coverage_report(df: pd.DataFrame, group_by: Sequence[str] = ("direction", "country", "code")) -> pd.DataFrame:
-    """Report expected versus observed monthly coverage for every series."""
+def coverage_report(
+    df: pd.DataFrame,
+    group_by: Sequence[str] = ("direction", "country", "code"),
+    *,
+    expected_start: object | None = None,
+    expected_end: object | None = None,
+) -> pd.DataFrame:
+    """Report observed months and internal/boundary gaps for every series.
+
+    When explicit expected bounds are omitted, each series is assessed from
+    its first observed month through its last observed month.
+    """
+    if (expected_start is None) != (expected_end is None):
+        raise ValueError("Provide both expected_start and expected_end, or neither.")
+    requested_start = pd.Timestamp(expected_start).to_period("M") if expected_start is not None else None
+    requested_end = pd.Timestamp(expected_end).to_period("M") if expected_end is not None else None
+    if requested_start is not None and requested_end < requested_start:
+        raise ValueError("expected_end must be on or after expected_start.")
     data = df.copy(); data["date"] = pd.to_datetime(data.date).dt.to_period("M")
     rows = []
     for keys, group in data.groupby(list(group_by)):
         periods = sorted(group.date.unique())
-        expected = pd.period_range(periods[0], periods[-1], freq="M") if periods else []
+        start = requested_start if requested_start is not None else periods[0]
+        end = requested_end if requested_end is not None else periods[-1]
+        expected = pd.period_range(start, end, freq="M")
+        observed = [period for period in periods if start <= period <= end]
+        observed_set = set(observed)
+        missing = [period for period in expected if period not in observed_set]
+        leading = [period for period in missing if period < periods[0]]
+        trailing = [period for period in missing if period > periods[-1]]
+        internal = [period for period in missing if periods[0] <= period <= periods[-1]]
         rows.append(dict(zip(group_by, keys if isinstance(keys, tuple) else (keys,)),
                          first_month=str(periods[0]), last_month=str(periods[-1]),
-                         observed_months=len(periods), missing_months=len(expected) - len(periods)))
+                         expected_start=str(start), expected_end=str(end),
+                         expected_months=len(expected), observed_months=len(observed),
+                         missing_months=len(missing), internal_missing_months=len(internal),
+                         missing_leading_months=len(leading), missing_trailing_months=len(trailing),
+                         missing_periods=[str(period) for period in missing]))
     return pd.DataFrame(rows)
 
 
@@ -201,7 +232,11 @@ def country_product_ranking(df: pd.DataFrame, country: str, direction: str,
 
 def product_country_comparison(df: pd.DataFrame, countries: Iterable[str], codes: Iterable[str], direction: str,
                                period: Optional[tuple[object, object]] = None) -> pd.DataFrame:
-    """Compare selected HS code prefixes across countries using JPY values."""
+    """Compare HS prefixes using JPY, treating absent selected rows as zero.
+
+    That zero interpretation assumes the input represents a complete HS
+    universe; partial extracts cannot distinguish omission from no trade.
+    """
     data = _value_data(df, direction)
     country_codes = list(dict.fromkeys(_resolve_country(data, country) for country in countries))
     prefixes = _normalize_prefixes(codes)

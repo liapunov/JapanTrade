@@ -204,6 +204,18 @@ def test_save_to_file_with_custom_filename_and_parquet(tmp_path):
     assert metadata["max_date"] == "2021-02-01"
 
 
+def test_tradefile_rejects_nulls_when_loading_and_saving(tmp_path):
+    source = tmp_path / "normalized-with-null.csv"
+    _sample_normalized_df().assign(direction="export", unit=pd.NA).to_csv(source, index=False)
+    with pytest.raises(ValueError, match=r"unit=2"):
+        TradeFile(source, raw=False, kind="HS", direction="export")
+
+    trade = _build_tradefile()
+    trade.data = _sample_normalized_df().assign(unit=pd.NA)
+    with pytest.raises(ValueError, match=r"unit=2"):
+        trade.save_to_file(tmp_path / "invalid.parquet", fmt="parquet")
+
+
 def test_raw_zip_to_parquet_to_ranking_golden_path(tmp_path):
     fixture = Path(__file__).parent / "fixtures" / "raw_hs_golden.csv"
     archive_path = tmp_path / "raw.zip"

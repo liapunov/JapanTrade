@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rejected null values in every required normalized record field.
+- Added optional expected coverage bounds with leading, internal, and trailing gap diagnostics.
+- Corrected installation guidance for the currently unpublished GitHub package.
 - Enforced complete current and prior comparison windows with country/month diagnostics.
 - Added normalized primary-key conflict detection and bounded MCP table responses.
 - Consolidated development dependencies around `pyproject.toml` and a committed `uv.lock`.

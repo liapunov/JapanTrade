@@ -27,9 +27,11 @@ Start a new Codex thread after installation. When updating the plugin locally, r
 | `find_hs_codes` | Find categories by keyword or HS prefix. | `query` |
 | `rank_country_products` | Rank HS categories for one partner country. | `dataset_path`, `country`, `direction` |
 | `compare_product_countries` | Compare selected HS prefixes across countries. | `dataset_path`, `countries`, `codes`, `direction` |
-| `dataset_coverage` | Diagnose missing months before or after an analysis. | `dataset_path` |
+| `dataset_coverage` | Diagnose internal and boundary month gaps before or after an analysis. | `dataset_path` |
 
 All dataset paths are explicit and must end in `.parquet` or `.csv`. Analysis tools return at most 100 structured records by default; use `max_records` to request a different response limit. Responses include total and returned row counts plus a `truncated` flag. Add `output_csv` ending in `.csv` when you want the complete table written; the server creates its parent directory and returns `csv_path` even when structured records are truncated.
+
+For a known reporting interval, pass both `expected_start` and `expected_end` to `dataset_coverage`. Its records distinguish internal, leading, and trailing missing months and include the exact missing periods. Without explicit bounds, expected coverage continues to run from each series' first observed month through its last.
 
 ## Recommended workflow
 
@@ -48,6 +50,8 @@ Example prompts:
 ## Interpretation and troubleshooting
 
 Values are JPY. The default analysis period is the latest 12 available months versus the preceding 12 months. Country names must be exact English lookup names, or use Japan Customs country codes.
+
+Comparisons treat missing selected-product rows as zero only when the prepared dataset represents the complete HS universe. A partial/custom extract cannot distinguish an omitted product from zero reported trade.
 
 - **Server does not start:** Run `uv sync --extra mcp` at the repository root and confirm the plugin’s MCP configuration still has that repository as its working directory.
 - **Dataset error:** Use an existing prepared CSV/Parquet with a `direction` column. The plugin intentionally does not infer a dataset path or a direction.

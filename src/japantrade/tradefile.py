@@ -162,6 +162,7 @@ the data.
             self.data, self.kind = self._openNormalFile(source, kind)
             self.data = self._ensure_kind_column(self.data, self.kind)
             self.data = self._ensure_direction_column(self.data, direction, legacy_ok=False)
+        self.data = self._deduplicate_by_key(self.data)
 
     def _ensure_direction_column(self, df, direction, legacy_ok=True):
         """Attach a direction to raw-normalized data and validate saved data."""
@@ -947,6 +948,7 @@ files were provided as merge parameters. The dataframe will be ignored.")
         if not hasattr(self, "normalization_config") or self.normalization_config is None:
             self.normalization_config = NormalizationConfig()
         self.data = self._ensure_direction_column(self.data, getattr(self, "direction", "import"))
+        self.data = self._deduplicate_by_key(self.data)
         resolved_fmt = fmt.lower() if fmt else None
         if resolved_fmt and resolved_fmt not in self.normalization_config.output_formats:
             raise ValueError(

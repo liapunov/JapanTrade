@@ -115,13 +115,21 @@ def compare_product_countries(dataset_path: str, countries: list[str], codes: li
 @mcp.tool()
 def dataset_coverage(dataset_path: str, direction: str | None = None, countries: list[str] | None = None,
                      codes: list[str] | None = None, output_csv: str | None = None,
-                     max_records: int = 100) -> dict[str, Any]:
-    """Report month coverage for direction/country/product series in a dataset."""
+                     max_records: int = 100, expected_start: str | None = None,
+                     expected_end: str | None = None) -> dict[str, Any]:
+    """Report month gaps; expected_start and expected_end reveal boundary gaps."""
+    if (expected_start is None) != (expected_end is None):
+        raise ValueError("Provide both expected_start and expected_end, or neither.")
     _, data = _load_dataset(dataset_path)
     filtered = apply_parameterized_filters(data, direction=direction, countries=countries, codes=codes)
     if filtered.empty:
         raise ValueError("No rows match the requested coverage filters.")
-    return _table_response(build_coverage_report(filtered), output_csv, max_records=max_records, analysis="coverage_report")
+    report = build_coverage_report(
+        filtered,
+        expected_start=expected_start,
+        expected_end=expected_end,
+    )
+    return _table_response(report, output_csv, max_records=max_records, analysis="coverage_report")
 
 
 def main() -> None:
