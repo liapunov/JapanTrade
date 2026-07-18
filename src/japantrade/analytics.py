@@ -8,8 +8,13 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
+from .schema import (
+    deduplicate_normalized_data,
+    validate_direction_values,
+    validate_required_columns,
+)
+
 VALUE_UNIT = "JPY"
-REQUIRED_COLUMNS = {"direction", "kind", "country", "code", "date", "unit", "value"}
 
 
 @dataclass
@@ -26,19 +31,14 @@ def load_normalized_data(source: str | Path | io.BytesIO | io.StringIO) -> pd.Da
     """Load a prepared CSV or Parquet dataset and validate its v1 schema."""
     path = str(source) if isinstance(source, (str, Path)) else None
     df = pd.read_parquet(source) if path and path.endswith(".parquet") else pd.read_csv(source, dtype=str)
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        if missing == {"direction"}:
-            raise ValueError("Dataset has no 'direction' column. Re-run `japantrade prepare` from raw data.")
-        raise ValueError(f"Missing expected columns: {', '.join(sorted(missing))}")
+    validate_required_columns(df)
     result = df.copy()
     result["date"] = pd.to_datetime(result["date"], errors="raise")
     result["value"] = pd.to_numeric(result["value"], errors="raise")
     result["country"] = result["country"].astype(str).str.zfill(3)
     result["code"] = result["code"].astype(str).str.replace(r"\s+", "", regex=True)
-    if not set(result["direction"].unique()).issubset({"import", "export"}):
-        raise ValueError("direction must contain only 'import' and 'export'.")
-    return result
+    validate_direction_values(result["direction"].unique())
+    return deduplicate_normalized_data(result)
 
 
 def available_filters(df: pd.DataFrame):
@@ -81,7 +81,15 @@ def filter_dataframe(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 def _value_data(df: pd.DataFrame, direction: str) -> pd.DataFrame:
     if direction not in {"import", "export"}:
         raise ValueError("direction must be 'import' or 'export'.")
-    result = df[(df["direction"] == direction) & (df["kind"] == "HS") & (df["unit"] == VALUE_UNIT)].copy()
+    validate_required_columns(df)
+    validate_direction_values(df["direction"].unique())
+    normalized = df.copy()
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="raise")
+    normalized["value"] = pd.to_numeric(normalized["value"], errors="raise")
+    normalized["country"] = normalized["country"].astype(str).str.zfill(3)
+    normalized["code"] = normalized["code"].astype(str).str.replace(r"\s+", "", regex=True)
+    normalized = deduplicate_normalized_data(normalized)
+    result = normalized[(normalized["direction"] == direction) & (normalized["kind"] == "HS") & (normalized["unit"] == VALUE_UNIT)].copy()
     result["date"] = pd.to_datetime(result["date"])
     if result.empty:
         raise ValueError("No HS JPY-value rows match the requested direction.")
@@ -99,6 +107,45 @@ def _period_bounds(df: pd.DataFrame, period: Optional[tuple[object, object]] = N
     previous_end = start - pd.DateOffset(months=1)
     previous_start = previous_end - pd.DateOffset(months=months - 1)
     return previous_start, previous_end, start, end
+
+
+def _missing_months(data: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> list[str]:
+    expected = pd.period_range(start, end, freq="M")
+    observed = set(pd.to_datetime(data["date"]).dt.to_period("M"))
+    return [str(month) for month in expected if month not in observed]
+
+
+def _validate_comparison_coverage(
+    data: pd.DataFrame,
+    bounds: tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp],
+    countries: Sequence[str],
+) -> None:
+    previous_start, previous_end, start, end = bounds
+    failures = []
+    for country in countries:
+        country_data = data[data["country"] == country]
+        for label, window_start, window_end in (
+            ("previous", previous_start, previous_end),
+            ("current", start, end),
+        ):
+            missing = _missing_months(country_data, window_start, window_end)
+            if missing:
+                failures.append(f"{country} {label} window missing {', '.join(missing)}")
+    if failures:
+        raise ValueError("Incomplete comparison window: " + "; ".join(failures))
+
+
+def _normalize_prefixes(codes: Iterable[str]) -> tuple[str, ...]:
+    cleaned = []
+    for code in codes:
+        prefix = str(code).replace(" ", "")
+        if not prefix or not prefix.isdigit():
+            raise ValueError("HS code prefixes must be non-empty numeric strings.")
+        if prefix not in cleaned:
+            cleaned.append(prefix)
+    if not cleaned:
+        raise ValueError("Provide at least one HS code or prefix.")
+    return tuple(prefix for prefix in cleaned if not any(prefix.startswith(other) for other in cleaned if prefix != other))
 
 
 def coverage_report(df: pd.DataFrame, group_by: Sequence[str] = ("direction", "country", "code")) -> pd.DataFrame:
@@ -132,9 +179,10 @@ def country_product_ranking(df: pd.DataFrame, country: str, direction: str,
     if hs_level not in {2, 4, 6}: raise ValueError("hs_level must be one of 2, 4, or 6.")
     data = _value_data(df, direction); country_code = _resolve_country(data, country)
     data = data[data.country == country_code].copy()
-    previous_start, previous_end, start, end = _period_bounds(data, period)
+    bounds = _period_bounds(data, period)
+    previous_start, previous_end, start, end = bounds
+    _validate_comparison_coverage(data, bounds, [country_code])
     current = data[data.date.between(start, end)]; previous = data[data.date.between(previous_start, previous_end)]
-    if current.empty or previous.empty: raise ValueError("Insufficient data for the requested comparison window.")
     for frame in (current, previous): frame["hs_code"] = frame.code.str[:hs_level]
     current_totals = current.groupby("hs_code").value.sum().rename("current_value")
     previous_totals = previous.groupby("hs_code").value.sum().rename("prior_value")
@@ -155,18 +203,21 @@ def product_country_comparison(df: pd.DataFrame, countries: Iterable[str], codes
                                period: Optional[tuple[object, object]] = None) -> pd.DataFrame:
     """Compare selected HS code prefixes across countries using JPY values."""
     data = _value_data(df, direction)
-    country_codes = [_resolve_country(data, country) for country in countries]
-    prefixes = tuple(str(code).replace(" ", "") for code in codes)
-    data = data[data.country.isin(country_codes) & data.code.str.startswith(prefixes)].copy()
-    previous_start, previous_end, start, end = _period_bounds(data, period)
-    current = data[data.date.between(start, end)].groupby("country").value.sum().rename("current_value")
-    previous = data[data.date.between(previous_start, previous_end)].groupby("country").value.sum().rename("prior_value")
-    result = pd.concat([current, previous], axis=1).fillna(0).reset_index()
+    country_codes = list(dict.fromkeys(_resolve_country(data, country) for country in countries))
+    prefixes = _normalize_prefixes(codes)
+    country_data = data[data.country.isin(country_codes)].copy()
+    bounds = _period_bounds(country_data, period)
+    previous_start, previous_end, start, end = bounds
+    _validate_comparison_coverage(country_data, bounds, country_codes)
+    selected = country_data[country_data.code.str.startswith(prefixes)].copy()
+    current = selected[selected.date.between(start, end)].groupby("country").value.sum().reindex(country_codes, fill_value=0).rename("current_value")
+    previous = selected[selected.date.between(previous_start, previous_end)].groupby("country").value.sum().reindex(country_codes, fill_value=0).rename("prior_value")
+    result = pd.concat([current, previous], axis=1).reset_index()
     result["absolute_change"] = result.current_value - result.prior_value
     result["growth"] = result.absolute_change.div(result.prior_value.where(result.prior_value != 0))
     result["selected_market_share"] = result.current_value / result.current_value.sum()
     result["direction"] = direction; result["period_start"] = start; result["period_end"] = end
-    if "country_name" in data: result = result.merge(data[["country", "country_name"]].drop_duplicates(), on="country", how="left")
+    if "country_name" in country_data: result = result.merge(country_data[["country", "country_name"]].drop_duplicates(), on="country", how="left")
     return result.sort_values("current_value", ascending=False).reset_index(drop=True)
 
 

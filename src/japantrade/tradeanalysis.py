@@ -17,20 +17,10 @@ This module contains a single class, TradeFile.
 from __future__ import print_function
 import logging
 import pandas as pd
-from tradefile import TradeFile as trf
+from .tradefile import TradeFile as trf
 
 
-# logging settings for file and console
-# thanks to @Escualo, https://stackoverflow.com/a/9321890
-logging.basicConfig(level=logging.DEBUG,
-                    filename='develop-logging.log',
-                    format='%(asctime)s %(levelname)s:%(message)s')
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
-console.setFormatter(formatter)
-logging.getLogger().addHandler(console)
-log = logging.getLogger("tradeanalysis")
+log = logging.getLogger(__name__)
 
 default_pc_dict = "../data/PC_codes.csv"
 default_hs_dict = "../data/HS_codes.csv"

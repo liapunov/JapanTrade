@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Enforced complete current and prior comparison windows with country/month diagnostics.
+- Added normalized primary-key conflict detection and bounded MCP table responses.
+- Consolidated development dependencies around `pyproject.toml` and a committed `uv.lock`.
+- Removed import-time root logging configuration and its automatic log file.
 - Added a dedicated Codex MCP plugin guide and refreshed the root workflow and troubleshooting documentation.
 - Modernized the tutorial notebooks around the current package, CLI, direction-safe data model, and analyst APIs.
 

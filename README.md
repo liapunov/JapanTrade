@@ -1,5 +1,7 @@
 # JapanTrade
 
+[![CI](https://github.com/liapunov/JapanTrade/actions/workflows/ci.yml/badge.svg)](https://github.com/liapunov/JapanTrade/actions/workflows/ci.yml)
+
 JapanTrade downloads, prepares, and analyzes Japanese Customs HS import and export data. It supports two analyst workflows: ranking product categories for one trading partner and comparing selected HS categories across countries.
 
 The data comes from the Japanese government e-Stat/Japan Customs releases. JapanTrade is not an official government service. Record release periods and source metadata when publishing results.
@@ -15,7 +17,7 @@ pip install "japantrade[parquet]"
 For repository development, create a development environment:
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --locked
 uv run pytest -q
 ```
 
@@ -76,14 +78,14 @@ Country inputs accept an official Japan Customs code or an exact English country
 
 Prepared datasets require `direction`, `kind`, `country`, `code`, `date`, `unit`, and `value`. They may also contain `country_name` and `code_description`. Direction is part of a record identity, so imports and exports cannot overwrite one another.
 
-V1 comparisons use JPY value only. Quantity rows are preserved but are not comparable across different units. Rankings default to HS-4 and compare the latest 12 available months with the preceding 12 months; pass both `--date-start` and `--date-end` to choose another window.
+V1 comparisons use JPY value only. Quantity rows are preserved but are not comparable across different units. Rankings default to HS-4 and compare the latest 12 available months with the preceding 12 months; pass both `--date-start` and `--date-end` to choose another window. Both the current and preceding windows must contain every expected calendar month for each requested country. Incomplete windows are rejected with the missing months listed; JapanTrade never reports growth from partial periods.
 
 Japan Customs rows use 9-digit tariff codes while the bundled HS lookup usually has 2-, 4-, and 6-digit entries. JapanTrade uses the most-specific available prefix description. Ranking reports label the requested HS level directly.
 
 ## Troubleshooting
 
 - **e-Stat timeout:** Retry a single year first. For a longer timeout, call `CustomsGrabber.grabRange(..., request_timeout=180)` from Python.
-- **“Insufficient data” in a ranking:** Run `dataset_coverage` through the MCP plugin or inspect dates/direction in the dataset. The default comparison needs two complete 12-month windows.
+- **“Incomplete comparison window” in an analysis:** Run `dataset_coverage` through the MCP plugin or inspect dates/direction in the dataset. The error lists missing country/month combinations; the default comparison needs two complete 12-month windows.
 - **Direction mismatch:** Do not combine imports and exports under one direction. Re-prepare raw files with the correct explicit direction.
 - **Missing descriptions:** Use `enrich_hs_descriptions` to refresh an existing prepared dataset, or re-run the ranking after upgrading JapanTrade.
 
@@ -96,3 +98,7 @@ The repository includes a local Codex plugin for prepared-dataset analysis. See 
 The exploratory Streamlit dashboard in `src/japantrade/app.py` provides filtering, charts, CSV export, and example DuckDB queries. It ships with the bundled fixture at `tests/fixtures/normalized_sample.csv`; you can also upload a normalized CSV.
 
 The legacy notebooks have been rewritten as current tutorials. The supported interfaces are the Python API, CLI, MCP server, and these notebooks; the Streamlit app remains exploratory.
+
+## Case study
+
+The reproducible [Italy–Japan trade case study](examples/italy-japan-trade/README.md) demonstrates ranking and country-comparison workflows with a small, explicitly synthetic dataset, checked outputs, and a chart.

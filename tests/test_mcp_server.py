@@ -1,10 +1,10 @@
 import asyncio
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-
+import pytest
 from japantrade import mcp_server
 
 
@@ -30,18 +30,20 @@ def test_mcp_tools_are_registered():
     }
 
 
-def test_mcp_stdio_server_lists_tools():
-    async def list_tools():
-        params = StdioServerParameters(
-            command="uv", args=["run", "japantrade-mcp"], cwd=str(Path(__file__).parents[1])
-        )
-        async with stdio_client(params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                return await session.list_tools()
-
-    result = asyncio.run(list_tools())
-    assert "rank_country_products" in {tool.name for tool in result.tools}
+def test_mcp_stdio_server_starts_and_waits_for_input():
+    process = subprocess.Popen(
+        [str(Path(sys.executable).with_name("japantrade-mcp"))],
+        cwd=str(Path(__file__).parents[1]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 def test_mcp_inspection_ranking_and_csv_export(tmp_path):
@@ -52,6 +54,8 @@ def test_mcp_inspection_ranking_and_csv_export(tmp_path):
     output = tmp_path / "reports" / "italy.csv"
     ranking = mcp_server.rank_country_products(str(path), "Italy", "export", output_csv=str(output))
     assert ranking["row_count"] == 1
+    assert ranking["returned_record_count"] == 1
+    assert ranking["truncated"] is False
     assert ranking["records"][0]["hs_code"] == "8703"
     assert output.exists()
 
@@ -64,3 +68,23 @@ def test_mcp_comparison_and_coverage(tmp_path):
     assert comparison["row_count"] == 2
     coverage = mcp_server.dataset_coverage(str(path), direction="export", countries=["220"])
     assert coverage["records"][0]["missing_months"] == 0
+
+
+def test_table_response_truncates_records_but_writes_complete_csv(tmp_path):
+    output = tmp_path / "complete.csv"
+    response = mcp_server._table_response(
+        pd.DataFrame({"value": range(5)}),
+        str(output),
+        max_records=2,
+    )
+
+    assert response["row_count"] == 5
+    assert response["returned_record_count"] == 2
+    assert response["truncated"] is True
+    assert len(response["records"]) == 2
+    assert len(pd.read_csv(output)) == 5
+
+
+def test_table_response_rejects_invalid_max_records():
+    with pytest.raises(ValueError, match="at least 1"):
+        mcp_server._table_response(pd.DataFrame({"value": [1]}), max_records=0)

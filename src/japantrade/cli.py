@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -75,6 +76,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = build_argument_parser().parse_args(list(argv) if argv is not None else None)
     if args.command == "download":
         start, end = args.years
