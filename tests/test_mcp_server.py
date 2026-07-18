@@ -70,6 +70,41 @@ def test_mcp_comparison_and_coverage(tmp_path):
     assert coverage["records"][0]["missing_months"] == 0
 
 
+def test_mcp_coverage_accepts_expected_boundaries(tmp_path):
+    path = _dataset(tmp_path)
+    output = tmp_path / "coverage.csv"
+    coverage = mcp_server.dataset_coverage(
+        str(path),
+        direction="export",
+        countries=["220"],
+        output_csv=str(output),
+        expected_start="2022-11-01",
+        expected_end="2025-02-01",
+    )
+
+    record = coverage["records"][0]
+    assert record["expected_months"] == 28
+    assert record["observed_months"] == 24
+    assert record["missing_leading_months"] == 2
+    assert record["missing_trailing_months"] == 2
+    assert record["missing_periods"] == ["2022-11", "2022-12", "2025-01", "2025-02"]
+    exported = pd.read_csv(output)
+    assert exported.loc[0, "expected_months"] == 28
+    assert "2022-11" in exported.loc[0, "missing_periods"]
+
+
+def test_mcp_coverage_requires_both_expected_boundaries(tmp_path):
+    path = _dataset(tmp_path)
+    with pytest.raises(ValueError, match="both expected_start and expected_end"):
+        mcp_server.dataset_coverage(str(path), expected_start="2024-01-01")
+    with pytest.raises(ValueError, match="on or after"):
+        mcp_server.dataset_coverage(
+            str(path),
+            expected_start="2024-02-01",
+            expected_end="2024-01-01",
+        )
+
+
 def test_table_response_truncates_records_but_writes_complete_csv(tmp_path):
     output = tmp_path / "complete.csv"
     response = mcp_server._table_response(

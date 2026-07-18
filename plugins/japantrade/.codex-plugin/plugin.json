@@ -1,6 +1,6 @@
 {
   "name": "japantrade",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260718122746",
   "description": "Analyze prepared Japanese import and export trade datasets.",
   "author": {
     "name": "Local developer"
@@ -12,7 +12,10 @@
     "longDescription": "Search HS codes, inspect coverage, rank country products, and compare selected markets.",
     "developerName": "JapanTrade",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
     "defaultPrompt": [
       "Rank Japan's exports to Italy by HS-4 category.",
       "Compare Japan's exports of HS 8703 across selected countries."

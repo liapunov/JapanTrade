@@ -10,8 +10,10 @@ The data comes from the Japanese government e-Stat/Japan Customs releases. Japan
 
 Python 3.10+ is required. Use Parquet for prepared datasets.
 
+JapanTrade is not currently published on PyPI. Install the current package directly from GitHub:
+
 ```bash
-pip install "japantrade[parquet]"
+python -m pip install "japantrade[parquet] @ git+https://github.com/liapunov/JapanTrade.git@master"
 ```
 
 For repository development, create a development environment:
@@ -76,9 +78,13 @@ Country inputs accept an official Japan Customs code or an exact English country
 
 ## Data contract and interpretation
 
-Prepared datasets require `direction`, `kind`, `country`, `code`, `date`, `unit`, and `value`. They may also contain `country_name` and `code_description`. Direction is part of a record identity, so imports and exports cannot overwrite one another.
+Prepared datasets require non-null `direction`, `kind`, `country`, `code`, `date`, `unit`, and `value`. They may also contain `country_name` and `code_description`. Direction is part of a record identity, so imports and exports cannot overwrite one another.
 
 V1 comparisons use JPY value only. Quantity rows are preserved but are not comparable across different units. Rankings default to HS-4 and compare the latest 12 available months with the preceding 12 months; pass both `--date-start` and `--date-end` to choose another window. Both the current and preceding windows must contain every expected calendar month for each requested country. Incomplete windows are rejected with the missing months listed; JapanTrade never reports growth from partial periods.
+
+Country comparisons interpret an absent selected product row as zero trade only when the input represents a complete HS universe. In a partial or user-curated extract, absence may instead mean that the product was not included; use complete prepared Customs extracts when relying on zero values or growth from zero.
+
+For coverage diagnostics against a known reporting interval, call `coverage_report(data, expected_start="2024-01-01", expected_end="2024-12-01")`. The result separates leading, internal, and trailing missing months.
 
 Japan Customs rows use 9-digit tariff codes while the bundled HS lookup usually has 2-, 4-, and 6-digit entries. JapanTrade uses the most-specific available prefix description. Ranking reports label the requested HS level directly.
 

@@ -108,6 +108,31 @@ def test_loader_requires_direction(tmp_path):
         load_normalized_data(path)
 
 
+@pytest.mark.parametrize(
+    "column",
+    ["direction", "kind", "country", "code", "date", "unit", "value"],
+)
+def test_loader_rejects_null_required_values(tmp_path, column):
+    data = _dataset().iloc[[0]].copy()
+    data[column] = pd.NA
+    path = tmp_path / f"null-{column}.csv"
+    data.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match=rf"{column}=1"):
+        load_normalized_data(path)
+
+
+def test_loader_reports_all_null_required_columns(tmp_path):
+    data = _dataset().iloc[[0]].copy()
+    data["direction"] = pd.NA
+    data["unit"] = pd.NA
+    path = tmp_path / "multiple-nulls.csv"
+    data.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match=r"direction=1, unit=1"):
+        load_normalized_data(path)
+
+
 def test_hs_description_enrichment_uses_six_digit_prefix_for_tariff_codes():
     data = pd.DataFrame({"code": ["010110000"]})
     enriched = enrich_hs_descriptions(data)
