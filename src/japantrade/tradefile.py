@@ -15,203 +15,37 @@ This module contains a single class, TradeFile.
 import os
 import logging
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, Optional
 import pandas as pd
-import zipfile as zfile
 from time import time
+
+from .ingestion import open_csv, open_zip, stream_raw_chunks
+from .dataset import merge_normalized_data, snapshot_state
+from .enrichment import load_code_lookup, load_country_lookup
+from .normalization import NormalizationConfig, NormalizationContext, NormalizationPipeline
+from .persistence import (
+    build_metadata,
+    build_output_path,
+    compression_from_suffix,
+    extension_for,
+    load_saved_file,
+    normalize_compression,
+)
+from .schema import PRIMARY_KEY, deduplicate_normalized_data
 
 MONTH_DICT = {'Jan': "01", 'Feb': "02", 'Mar': "03", 'Apr': "04",
               'May': "05", 'Jun': "06", 'Jul': "07", 'Aug': "08",
               'Sep': "09", 'Oct': "10", 'Nov': "11", 'Dec': "12"}
 
-# logging settings for file and console
-# thanks to @Escualo, https://stackoverflow.com/a/9321890
-logging.basicConfig(level=logging.DEBUG,
-                    filename='develop-logging.log',
-                    format='%(asctime)s %(levelname)s:%(message)s')
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
-console.setFormatter(formatter)
-logging.getLogger().addHandler(console)
-log = logging.getLogger("tradefile")
-
-
-@dataclass
-class NormalizationConfig:
-    """Configuration for the trade file normalization pipeline."""
-
-    chunk_size: int = 50000
-    use_tqdm: bool = False
-    parallel_chunks: bool = False
-    max_workers: Optional[int] = None
-    output_formats: Tuple[str, ...] = ("csv", "parquet")
-    include_descriptions: bool = True
-    convert_to_base_units: bool = False
-    keep_units: Optional[Tuple[str, ...]] = None
-    exclude_units: Optional[Tuple[str, ...]] = None
-    warn_on_unknown: bool = True
-    lookup_paths: Optional[dict] = None
-
-    def __post_init__(self):
-        self.output_formats = tuple(fmt.lower() for fmt in self.output_formats)
-        if self.keep_units is not None:
-            self.keep_units = tuple(unit.upper() for unit in self.keep_units)
-        if self.exclude_units is not None:
-            self.exclude_units = tuple(unit.upper() for unit in self.exclude_units)
-        if self.lookup_paths is not None:
-            self.lookup_paths = {key.lower(): Path(value) for key, value in self.lookup_paths.items()}
-
-
-@dataclass
-class NormalizationContext:
-    """Context passed to each normalization stage."""
-
-    kind: str
-    chunk_index: Optional[int] = None
-    metadata: dict = field(default_factory=dict)
-
-
-class NormalizationPipeline:
-    """Composable pipeline to normalize raw trade data chunks.
-
-    The pipeline wires together the canonical normalization steps (clean,
-    melt months, melt units, reduce rows) while allowing callers to inject
-    additional steps via :meth:`add_step`.
-    """
-
-    def __init__(self, processor: "TradeFile", config: NormalizationConfig, hooks: Optional[List[Tuple[str, Callable]]] = None):
-        self.processor = processor
-        self.config = config
-        self.logger = logging.getLogger("tradefile.pipeline")
-        self._custom_steps: List[dict] = []
-        self._tqdm = getattr(processor, "_tqdm", None)
-        if hooks:
-            for name, func in hooks:
-                self.add_step(name, func)
-
-    def add_step(self, name: str, func: Callable, position: Optional[int] = None,
-                 before: Optional[str] = None, after: Optional[str] = None):
-        """Register a custom step.
-
-        Parameters
-        ----------
-        name : str
-            Display name for the step.
-        func : Callable
-            Callable with signature ``func(df, context) -> (df, metrics_dict)``.
-        position : int, optional
-            Absolute index to insert the step in the pipeline order.
-        before : str, optional
-            Insert before the named step.
-        after : str, optional
-            Insert after the named step.
-        """
-        self._custom_steps.append({
-            "name": name,
-            "func": func,
-            "position": position,
-            "before": before,
-            "after": after
-        })
-
-    def _default_steps(self) -> List[Tuple[str, Callable]]:
-        def clean(df, context):
-            cleaned = self.processor._cleanDataFile(df)
-            self.processor._validate_raw_schema(cleaned.columns, context.kind)
-            return cleaned, {}
-
-        def melt_months(df, context):
-            return self.processor._meltMonths(df, context.kind)
-
-        def melt_units(df, context):
-            return self.processor._meltUnits(df, context.kind)
-
-        def normalize_units(df, context):
-            return self.processor._normalize_units(df)
-
-        def reduce_rows(df, context):
-            return self.processor._reduce_rows(df), {}
-
-        def enrich(df, context):
-            return self.processor._enrich_with_lookups(df, context.kind)
-
-        return [
-            ("clean", clean),
-            ("melt_months", melt_months),
-            ("melt_units", melt_units),
-            ("normalize_units", normalize_units),
-            ("reduce", reduce_rows),
-            ("enrich", enrich),
-        ]
-
-    def _compose_steps(self) -> List[Tuple[str, Callable]]:
-        steps = list(self._default_steps())
-        for custom in self._custom_steps:
-            insertion = (custom["name"], custom["func"])
-            if custom.get("position") is not None:
-                steps.insert(custom["position"], insertion)
-                continue
-            if custom.get("before"):
-                try:
-                    idx = next(i for i, (name, _) in enumerate(steps) if name == custom["before"])
-                except StopIteration:
-                    idx = len(steps)
-                steps.insert(idx, insertion)
-                continue
-            if custom.get("after"):
-                try:
-                    idx = next(i for i, (name, _) in enumerate(steps) if name == custom["after"])
-                    steps.insert(idx + 1, insertion)
-                except StopIteration:
-                    steps.append(insertion)
-                continue
-            steps.append(insertion)
-        return steps
-
-    def _step_iterator(self, steps: List[Tuple[str, Callable]]):
-        if self._tqdm:
-            return self._tqdm(steps, desc="Normalizing chunk", unit="step")
-        return steps
-
-    def run(self, df: pd.DataFrame, kind: str, chunk_index: Optional[int] = None):
-        context = NormalizationContext(kind=kind, chunk_index=chunk_index)
-        composed_steps = self._compose_steps()
-        metrics: List[dict] = []
-        for name, func in self._step_iterator(composed_steps):
-            before_rows = len(df)
-            start = time()
-            result = func(df, context)
-            if isinstance(result, tuple) and len(result) == 2:
-                df, step_metrics = result
-            else:
-                df, step_metrics = result, {}
-            duration = time() - start
-            step_metrics = step_metrics or {}
-            step_metrics.update({
-                "duration": duration,
-                "before_rows": before_rows,
-                "after_rows": len(df)
-            })
-            metrics.append({"step": name, **step_metrics})
-            self.logger.info(
-                "Pipeline step '%s' completed for chunk %s | rows %s -> %s | %.2fs",
-                name,
-                chunk_index,
-                before_rows,
-                len(df),
-                duration
-            )
-        return df, metrics
+log = logging.getLogger(__name__)
 
 
 class TradeFile():
     # Direction is deliberately part of identity: imports and exports can have
     # identical country/product/month values and must never overwrite each other.
-    PRIMARY_KEY = ['direction', 'kind', 'country', 'code', 'date', 'unit']
+    PRIMARY_KEY = list(PRIMARY_KEY)
     """
     Trade data processing tool for the Japanese Customs database.
 
@@ -398,7 +232,7 @@ the data.
                 f"Cannot deduplicate dataframe. Missing primary key columns: {missing_key_cols}"
             )
         before = len(df)
-        deduped = df.drop_duplicates(subset=self._primary_key())
+        deduped = deduplicate_normalized_data(df)
         after = len(deduped)
         if after != before:
             log.info(
@@ -408,15 +242,7 @@ the data.
         return deduped
 
     def _snapshot_state(self, df):
-        key_columns = [col for col in self._primary_key() if col in df.columns]
-        ordered = df
-        if key_columns:
-            ordered = df.sort_values(by=key_columns)
-        ordered = ordered.reset_index(drop=True)
-        checksum = pd.util.hash_pandas_object(
-            ordered.fillna(""), index=False
-        ).sum()
-        return {"rows": len(df), "checksum": int(checksum)}
+        return snapshot_state(df)
 
     def _log_validation(self, stage, before_snapshot, after_snapshot, extra=None):
         payload = {
@@ -429,39 +255,13 @@ the data.
         log.info("Data validation", extra={"validation": payload})
 
     def _normalize_compression(self, compression):
-        if compression in (None, 'zip', 'gzip', 'bz2'):
-            return compression
-        if compression in ('gz',):
-            return 'gzip'
-        if compression in ('bz',):
-            return 'bz2'
-        raise ValueError("Unsupported compression. Use 'zip', 'gzip', or 'bz2'.")
+        return normalize_compression(compression)
 
     def _compression_from_suffix(self, suffix):
-        mapping = {
-            '.gz': 'gzip',
-            '.gzip': 'gzip',
-            '.zip': 'zip',
-            '.bz2': 'bz2'
-        }
-        return mapping.get(suffix)
+        return compression_from_suffix(suffix)
 
     def _extension_for(self, fmt, compression):
-        fmt = fmt.lower()
-        normalized_compression = self._normalize_compression(compression)
-        compression_extension = {
-            'zip': 'zip',
-            'gzip': 'gz',
-            'bz2': 'bz2',
-            None: None
-        }
-        if fmt == 'csv':
-            if normalized_compression in ('zip', 'gzip', 'bz2'):
-                return f".csv.{compression_extension[normalized_compression]}"
-            return ".csv"
-        if fmt == 'parquet':
-            return ".parquet"
-        raise ValueError("Unsupported format. Use 'csv' or 'parquet'.")
+        return extension_for(fmt, compression)
 
     def _default_filename(self, fmt, compression):
         ordered_timerange = self.data['date'].sort_values()
@@ -471,47 +271,10 @@ the data.
         return f"{self.kind}_{first_date}_{last_date}{extension}"
 
     def _build_output_path(self, path, filename, fmt, compression):
-        base_path = Path(path)
-        if base_path.suffix and filename is None:
-            target_dir = base_path.parent
-            filename = base_path.name
-        elif base_path.suffix:
-            target_dir = base_path.parent
-        else:
-            target_dir = base_path
-
-        resolved_fmt = fmt.lower() if fmt else None
-        resolved_compression = self._normalize_compression(compression)
-        if filename:
-            target_path = target_dir / filename
-            suffixes = target_path.suffixes
-            if suffixes:
-                detected_compression = self._compression_from_suffix(suffixes[-1])
-                if detected_compression:
-                    resolved_compression = resolved_compression or detected_compression
-                    if len(suffixes) > 1:
-                        resolved_fmt = resolved_fmt or suffixes[-2].lstrip('.')
-                else:
-                    resolved_fmt = resolved_fmt or suffixes[-1].lstrip('.')
-            else:
-                resolved_fmt = resolved_fmt or 'csv'
-                target_path = target_path.with_suffix(self._extension_for(resolved_fmt, resolved_compression))
-        else:
-            resolved_fmt = resolved_fmt or 'csv'
-            target_path = target_dir / self._default_filename(resolved_fmt, resolved_compression)
-
-        if not target_path.suffix:
-            resolved_fmt = resolved_fmt or 'csv'
-            target_path = target_path.with_suffix(self._extension_for(resolved_fmt, resolved_compression))
-
-        return target_path, resolved_fmt, resolved_compression
+        return build_output_path(self.data, self.kind, path, filename, fmt, compression)
 
     def _load_saved_file(self, target_path, fmt, compression):
-        if fmt == 'parquet':
-            return pd.read_parquet(target_path)
-        if fmt == 'csv':
-            return pd.read_csv(target_path, compression=compression)
-        raise ValueError("Unsupported format for loading. Use 'csv' or 'parquet'.")
+        return load_saved_file(target_path, fmt, compression)
 
 
     def _infer_kind(self, df, raw=True):
@@ -627,23 +390,10 @@ the data.
         return {'zip': self._openzip, 'csv': self._opencsv}
 
     def _openzip(self, filename, trade_types, raw=True):
-        pieces = []
-        with zfile.ZipFile(filename) as z:
-            for f in z.namelist():
-                if f[-4:] == ".csv":
-                    with z.open(f) as piece:
-                        df = pd.read_csv(piece, dtype=trade_types)
-                        if raw:
-                            df = self._cleanDataFile(df)
-                        pieces.append(df)
-            merged = pd.concat(pieces, axis=0)
-            return merged
+        return open_zip(filename, trade_types, self._cleanDataFile if raw else None)
 
     def _opencsv(self, filename, trade_types, raw=True):
-        df = pd.read_csv(filename, dtype=trade_types)
-        if raw:
-            df = self._cleanDataFile(df)
-        return df
+        return open_csv(filename, trade_types, self._cleanDataFile if raw else None)
 
     def _validate_raw_schema(self, columns, kind):
         base_columns = {'Year', 'Country'}
@@ -674,27 +424,7 @@ the data.
         return True
 
     def _stream_raw_chunks(self, filename, trade_types, chunk_size):
-        if filename.endswith('.zip'):
-            with zfile.ZipFile(filename) as z:
-                for f in z.namelist():
-                    if f.endswith(".csv"):
-                        with z.open(f) as piece:
-                            total_rows = 0
-                            for i, chunk in enumerate(pd.read_csv(
-                                    piece, dtype=trade_types,
-                                    chunksize=chunk_size)):
-                                total_rows += len(chunk)
-                                log.info(f"Loaded chunk {i+1} from {f} with "
-                                         f"{len(chunk)} rows (total {total_rows}).")
-                                yield chunk
-        else:
-            total_rows = 0
-            for i, chunk in enumerate(pd.read_csv(
-                    filename, dtype=trade_types, chunksize=chunk_size)):
-                total_rows += len(chunk)
-                log.info(f"Loaded chunk {i+1} from {filename} with "
-                         f"{len(chunk)} rows (total {total_rows}).")
-                yield chunk
+        yield from stream_raw_chunks(filename, trade_types, chunk_size)
 
     def _persist_chunk(self, df, chunk_index):
         if not self.persist_path:
@@ -1085,32 +815,10 @@ No data were acquired.")
 
     def _code_lookup(self, kind: str) -> Optional[pd.DataFrame]:
         key = kind.lower()
-
-        def _loader(path: Path) -> pd.DataFrame:
-            df = pd.read_csv(path, delimiter=';', dtype=str)
-            df = df.rename(columns={"Code.1": "code", "Description": "code_description"})
-            if "code" not in df.columns or "code_description" not in df.columns:
-                return None
-            df["code"] = df["code"].astype(str).str.replace(r"\s+", "", regex=True)
-            df = df[["code", "code_description"]].dropna()
-            return df
-
-        return self._load_lookup(key, _loader)
+        return self._load_lookup(key, load_code_lookup)
 
     def _country_lookup(self) -> Optional[pd.DataFrame]:
-        def _loader(path: Path) -> pd.DataFrame:
-            df = pd.read_csv(path, dtype=str)
-            rename_map = {col: col.strip().lower().replace(" ", "_") for col in df.columns}
-            df = df.rename(columns=rename_map)
-            if "code" not in df.columns:
-                return None
-            df["code"] = df["code"].astype(str).str.zfill(3)
-            name_col = "country" if "country" in df.columns else df.columns[-1]
-            zone_col = "geographical_zone" if "geographical_zone" in df.columns else None
-            keep_cols = ["code", name_col] + ([zone_col] if zone_col else [])
-            return df[keep_cols].rename(columns={name_col: "country_name", "code": "country"})
-
-        return self._load_lookup("country", _loader)
+        return self._load_lookup("country", load_country_lookup)
 
     def _enrich_with_lookups(self, df: pd.DataFrame, kind: str):
         if not self.normalization_config.include_descriptions:
@@ -1205,15 +913,7 @@ files were provided as merge parameters. The dataframe will be ignored.")
             )
         self.kind = incoming_kind
 
-        if date_range:
-            start_date, end_date = date_range
-            new_data = new_data[new_data['date'].between(start_date, end_date)]
-            base_subset = self.data[~self.data['date'].between(start_date, end_date)]
-        else:
-            base_subset = self.data
-
-        combined = pd.concat([base_subset, new_data], ignore_index=True)
-        combined = self._deduplicate_by_key(combined)
+        combined = merge_normalized_data(self.data, new_data, date_range)
         after_snapshot = self._snapshot_state(combined)
         self._log_validation(
             "merge",
@@ -1285,16 +985,7 @@ files were provided as merge parameters. The dataframe will be ignored.")
             }
         )
         log.info(f"TradeFile.save_to_file: saved data to {target_path}.")
-        metadata = {
-            "schema_version": 1,
-            "kind": self.kind,
-            "directions": sorted(self.data["direction"].astype(str).unique()),
-            "source_files": [self.source] if getattr(self, "source", None) else [],
-            "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
-            "min_date": str(pd.to_datetime(self.data["date"]).min().date()),
-            "max_date": str(pd.to_datetime(self.data["date"]).max().date()),
-            "rows": int(len(self.data)),
-        }
+        metadata = build_metadata(self.data, self.kind, getattr(self, "source", None))
         target_path.with_suffix(target_path.suffix + ".metadata.json").write_text(
             json.dumps(metadata, indent=2), encoding="utf-8"
         )

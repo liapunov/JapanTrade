@@ -40,12 +40,22 @@ def _write_csv(df: pd.DataFrame, output_csv: str | None) -> str | None:
     return str(path)
 
 
-def _table_response(df: pd.DataFrame, output_csv: str | None = None, **metadata: Any) -> dict[str, Any]:
+def _table_response(
+    df: pd.DataFrame,
+    output_csv: str | None = None,
+    max_records: int = 100,
+    **metadata: Any,
+) -> dict[str, Any]:
+    if max_records < 1:
+        raise ValueError("max_records must be at least 1.")
     csv_path = _write_csv(df, output_csv)
+    returned = df.head(max_records)
     response: dict[str, Any] = {
         "row_count": int(len(df)),
+        "returned_record_count": int(len(returned)),
+        "truncated": len(returned) < len(df),
         "columns": list(df.columns),
-        "records": json.loads(df.to_json(orient="records", date_format="iso")),
+        "records": json.loads(returned.to_json(orient="records", date_format="iso")),
         **metadata,
     }
     if csv_path:
@@ -66,30 +76,31 @@ def inspect_dataset(dataset_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def find_hs_codes(query: str, level: int | None = None, limit: int = 20) -> dict[str, Any]:
+def find_hs_codes(query: str, level: int | None = None, limit: int = 20, max_records: int = 100) -> dict[str, Any]:
     """Find HS codes by keyword, exact code, or code prefix."""
     if limit < 1:
         raise ValueError("limit must be at least 1.")
-    return _table_response(search_hs(query, level=level, limit=limit))
+    return _table_response(search_hs(query, level=level, limit=limit), max_records=max_records)
 
 
 @mcp.tool()
 def rank_country_products(dataset_path: str, country: str, direction: str, hs_level: int = 4,
                           limit: int = 20, date_start: str | None = None,
-                          date_end: str | None = None, output_csv: str | None = None) -> dict[str, Any]:
+                          date_end: str | None = None, output_csv: str | None = None,
+                          max_records: int = 100) -> dict[str, Any]:
     """Rank HS products for one country; optionally write the result to CSV."""
     if (date_start is None) != (date_end is None):
         raise ValueError("Provide both date_start and date_end, or neither.")
     _, data = _load_dataset(dataset_path)
     period = (date_start, date_end) if date_start else None
     result = country_product_ranking(data, country, direction, period, hs_level, limit)
-    return _table_response(result, output_csv, analysis="country_product_ranking")
+    return _table_response(result, output_csv, max_records=max_records, analysis="country_product_ranking")
 
 
 @mcp.tool()
 def compare_product_countries(dataset_path: str, countries: list[str], codes: list[str], direction: str,
                               date_start: str | None = None, date_end: str | None = None,
-                              output_csv: str | None = None) -> dict[str, Any]:
+                              output_csv: str | None = None, max_records: int = 100) -> dict[str, Any]:
     """Compare selected HS products across countries; optionally write CSV."""
     if not countries or not codes:
         raise ValueError("Provide at least one country and one HS code or prefix.")
@@ -98,18 +109,19 @@ def compare_product_countries(dataset_path: str, countries: list[str], codes: li
     _, data = _load_dataset(dataset_path)
     period = (date_start, date_end) if date_start else None
     result = product_country_comparison(data, countries, codes, direction, period)
-    return _table_response(result, output_csv, analysis="product_country_comparison")
+    return _table_response(result, output_csv, max_records=max_records, analysis="product_country_comparison")
 
 
 @mcp.tool()
 def dataset_coverage(dataset_path: str, direction: str | None = None, countries: list[str] | None = None,
-                     codes: list[str] | None = None, output_csv: str | None = None) -> dict[str, Any]:
+                     codes: list[str] | None = None, output_csv: str | None = None,
+                     max_records: int = 100) -> dict[str, Any]:
     """Report month coverage for direction/country/product series in a dataset."""
     _, data = _load_dataset(dataset_path)
     filtered = apply_parameterized_filters(data, direction=direction, countries=countries, codes=codes)
     if filtered.empty:
         raise ValueError("No rows match the requested coverage filters.")
-    return _table_response(build_coverage_report(filtered), output_csv, analysis="coverage_report")
+    return _table_response(build_coverage_report(filtered), output_csv, max_records=max_records, analysis="coverage_report")
 
 
 def main() -> None:

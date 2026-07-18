@@ -1,0 +1,4 @@
+country,current_value,prior_value,absolute_change,growth,selected_market_share,direction,period_start,period_end,country_name
+304,3600,3000,600,0.2,0.47619047619047616,export,2024-01-01,2024-12-01,United States of America
+213,2160,2400,-240,-0.1,0.2857142857142857,export,2024-01-01,2024-12-01,Germany
+220,1800,1200,600,0.5,0.23809523809523808,export,2024-01-01,2024-12-01,Italy

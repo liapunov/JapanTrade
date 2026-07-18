@@ -10,16 +10,16 @@ Thank you for considering a contribution to JapanTrade. This project provides to
 
 ## Development setup
 
-1. Create a virtual environment and install dependencies:
+1. Create the locked development environment:
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
+   uv sync --extra dev --locked
+   uv run pytest -q
    ```
-2. For notebook work, install Jupyter (`pip install jupyter`).
-3. For the Streamlit app, run:
+2. For notebook work, add Jupyter to a separate environment rather than the package runtime dependencies.
+3. For the Streamlit app, install the app extra and run:
    ```bash
-   streamlit run src/japantrade/app.py
+   uv sync --extra app --locked
+   uv run streamlit run src/japantrade/app.py
    ```
 
 ## Pull request expectations

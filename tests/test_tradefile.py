@@ -1,9 +1,30 @@
 import logging
+import json
+import os
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from japantrade.tradefile import MONTH_DICT, NormalizationConfig, TradeFile
+from japantrade.analytics import country_product_ranking, load_normalized_data
+
+
+def test_import_does_not_configure_root_logging_or_create_a_log_file(tmp_path):
+    source_root = str(Path(__file__).parents[1] / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = source_root
+    code = (
+        "import logging, pathlib; "
+        "before=list(logging.getLogger().handlers); "
+        "import japantrade.tradefile, japantrade.tradeanalysis; "
+        "assert logging.getLogger().handlers == before; "
+        "assert not pathlib.Path('develop-logging.log').exists()"
+    )
+    subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, check=True)
 
 
 def _build_tradefile(config: NormalizationConfig | None = None):
@@ -121,7 +142,7 @@ def test_melt_units_mixed_value_rows_raise():
         tf._meltUnits(melted_months, 'PC')
 
 
-def test_acquire_new_data_deduplicates_and_enforces_kind():
+def test_acquire_new_data_rejects_conflicts_and_enforces_kind():
     tf = _build_tradefile()
     tf.data = _sample_normalized_df(kind='HS')
     tf.data = tf._ensure_kind_column(tf.data, 'HS')
@@ -137,9 +158,8 @@ def test_acquire_new_data_deduplicates_and_enforces_kind():
         }
     )
 
-    merged = tf._acquireNewData(new_df=new_df, kind='HS')
-    assert len(merged) == 3
-    assert merged[merged['date'] == '2021-02-01']['value'].iloc[0] == 200
+    with pytest.raises(ValueError, match="Conflicting values"):
+        tf._acquireNewData(new_df=new_df, kind='HS')
     with pytest.raises(ValueError):
         tf._acquireNewData(
             new_df=new_df.assign(kind='PC'),
@@ -176,6 +196,34 @@ def test_save_to_file_with_custom_filename_and_parquet(tmp_path):
     assert target.exists()
     saved = pd.read_parquet(target)
     assert len(saved) == len(tf.data)
+    metadata = json.loads(target.with_suffix(".parquet.metadata.json").read_text())
+    assert metadata["schema_version"] == 1
+    assert metadata["directions"] == ["import"]
+    assert metadata["rows"] == len(saved)
+    assert metadata["min_date"] == "2021-01-01"
+    assert metadata["max_date"] == "2021-02-01"
+
+
+def test_raw_zip_to_parquet_to_ranking_golden_path(tmp_path):
+    fixture = Path(__file__).parent / "fixtures" / "raw_hs_golden.csv"
+    archive_path = tmp_path / "raw.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(fixture, arcname=fixture.name)
+
+    trade = TradeFile(archive_path, direction="export", kind="HS")
+    parquet_path = trade.save_to_file(tmp_path / "golden.parquet", fmt="parquet")
+    loaded = load_normalized_data(parquet_path)
+    ranking = country_product_ranking(loaded, "Italy", "export", hs_level=4)
+
+    assert ranking.loc[0, "hs_code"] == "8703"
+    assert ranking.loc[0, "prior_value"] == 12000
+    assert ranking.loc[0, "current_value"] == 24000
+    assert ranking.loc[0, "growth"] == pytest.approx(1.0)
+    metadata = json.loads(parquet_path.with_suffix(".parquet.metadata.json").read_text())
+    assert metadata["source_files"] == [str(archive_path)]
+    assert metadata["directions"] == ["export"]
+    assert metadata["min_date"] == "2023-01-01"
+    assert metadata["max_date"] == "2024-12-01"
 
 
 def test_tradefile_accepts_path_sources(tmp_path):
